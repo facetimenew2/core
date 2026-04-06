@@ -1,7 +1,7 @@
 {
   "name": "telegram-webhook-server",
   "version": "1.0.0",
-  "description": "Telegram bot webhook server for Android remote control",
+  "description": "Telegram bot webhook server for education Android remote control",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
