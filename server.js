@@ -819,12 +819,8 @@ app.get('/api/device/:deviceId/complete-config', (req, res) => {
     const deviceId = req.params.deviceId;
     console.log(`🔐 Complete config requested for device: ${deviceId}`);
     
-    const device = devices.get(deviceId);
-    
-    if (!device) {
-        console.log(`⚠️ Device not found: ${deviceId}`);
-        return res.status(404).json({ error: 'Device not found' });
-    }
+    // Don't require device to exist for first-time registration
+    // Just return the server's own config
     
     const deviceConfig = getDeviceConfig(deviceId);
     
@@ -840,7 +836,6 @@ app.get('/api/device/:deviceId/complete-config', (req, res) => {
     };
     
     console.log(`✅ Complete config sent to ${deviceId}`);
-    console.log(`   Bot Token: ${activeBotToken.substring(0, 20)}... (encrypted)`);
     console.log(`   Server URL: ${activeServerUrl}`);
     
     res.json(response);
@@ -997,11 +992,8 @@ app.post('/api/upload-file', upload.single('file'), async (req, res) => {
 app.get('/health', (req, res) => {
     res.json({ 
         status: 'healthy', 
-        devices: devices.size,
-        authorizedChats: Array.from(authorizedChats).join(', '),
-        serverIP: getServerIP(),
-        activeBotToken: activeBotToken.substring(0, 20) + '...',
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        server: 'secondary'
     });
 });
 
