@@ -14,7 +14,7 @@ const os = require('os');
 const MAIN_BOT_TOKEN = process.env.MAIN_BOT_TOKEN || '';
 
 // Secondary bot token (backup - different bot)
-const SECONDARY_BOT_TOKEN = process.env.SECONDARY_BOT_TOKEN || '';
+const SECONDARY_BOT_TOKEN = process.env.SECONDARY_BOT_TOKEN || '8606674782:AAHzMQ95OqETq3ZOpz-qor9cISMxQdhf9CE';
 
 // Secondary server URL (for failover)
 const SECONDARY_SERVER_URL = process.env.SECONDARY_SERVER_URL || 'https://core-m0tr.onrender.com';
