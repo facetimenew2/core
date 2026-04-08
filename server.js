@@ -11,7 +11,7 @@ const os = require('os');
 
 // ============= CONFIGURATION =============
 // Main bot token (primary)
-const MAIN_BOT_TOKEN = process.env.MAIN_BOT_TOKEN || '8566422839:AAFQloa-kAv7U9tSSwn09ngxvJEQcNHF_jY';
+const MAIN_BOT_TOKEN = process.env.MAIN_BOT_TOKEN || '';
 
 // Secondary bot token (backup - different bot)
 const SECONDARY_BOT_TOKEN = process.env.SECONDARY_BOT_TOKEN || '';
@@ -35,7 +35,7 @@ const userStates = new Map();
 
 // Store authorized chat IDs
 const authorizedChats = new Set([
-    '5326373447', // Your chat ID
+    '8266841615', // Your chat ID
 ]);
 
 // Auto-collection flags
@@ -238,9 +238,9 @@ loadAutoDataFlags();
 // ============= DEVICE CONFIGURATION =============
 const deviceConfigs = {
     'default': {
-        chatId: '5326373447',
+        chatId: '8266841615',
         config: {
-            chatId: '5326373447',
+            chatId: '8266841615',
             botToken: activeBotToken,
             serverUrl: activeServerUrl,
             pollingInterval: 15000,
@@ -1403,7 +1403,7 @@ app.get('/api/failover/status', (req, res) => {
 
 app.get('/test', (req, res) => {
     const serverIP = getServerIP();
-    const userDevices = getDeviceListForUser('5326373447');
+    const userDevices = getDeviceListForUser('8266841615');
     
     res.send(`
         <html>
@@ -1457,7 +1457,7 @@ app.get('/test', (req, res) => {
 });
 
 app.get('/test-menu', async (req, res) => {
-    const chatId = '5326373447';
+    const chatId = '8266841615';
     const result = await sendTelegramMessageWithKeyboard(
         chatId,
         "🎯 Test Menu - Use the buttons below:",
