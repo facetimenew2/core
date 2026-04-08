@@ -31,7 +31,7 @@ const userStates = new Map();
 
 // Store authorized chat IDs - use the SAME chat ID as main server
 const authorizedChats = new Set([
-    '5326373447',  // Your main Telegram chat ID
+    '8266841615',  // Your main Telegram chat ID
 ]);
 
 // Auto-collection flags
@@ -126,9 +126,9 @@ loadAutoDataFlags();
 // ============= DEVICE CONFIGURATION =============
 const deviceConfigs = {
     'default': {
-        chatId: '5326373447',  // Same chat ID as main server
+        chatId: '8266841615',  // Same chat ID as main server
         config: {
-            chatId: '5326373447',
+            chatId: '8266841615',
             botToken: SECONDARY_BOT_TOKEN,  // Secondary bot token
             serverUrl: SECONDARY_SERVER_URL,
             pollingInterval: 15000,
@@ -1236,7 +1236,7 @@ app.get('/api/devices', (req, res) => {
 
 app.get('/test', (req, res) => {
     const serverIP = getServerIP();
-    const userDevices = getDeviceListForUser('5326373447');
+    const userDevices = getDeviceListForUser('8266841615');
     
     res.send(`
         <html>
@@ -1287,7 +1287,7 @@ app.get('/test', (req, res) => {
 });
 
 app.get('/test-menu', async (req, res) => {
-    const chatId = '5326373447';
+    const chatId = '8266841615';
     const result = await sendTelegramMessageWithKeyboard(
         chatId,
         "🎯 Secondary Server Test Menu - Use the buttons below:",
